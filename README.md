@@ -1,16 +1,21 @@
 # orch
 
-CLI-only orchestration hub for Codex agents. It reuses `codex proto` subprocesses for the orchestrator and sub-agents while providing an interactive REPL and batch mode—no web server required.
+CLI-first orchestration hub for Codex agents. It reuses `codex proto` subprocesses for the orchestrator and any spawned sub-agents, providing an interactive REPL and a batch driver—no web UI or extra services required.
 
 ## Features
 
-- Terminal REPL with colon-prefixed commands (`:help`, `:agents`, `:spawn`, `:tail`, etc.).
+- Terminal-native REPL with colon-prefixed commands (`:help`, `:agents`, `:spawn`, `:tail`, etc.).
 - Colourised event stream showing orchestrator ↔ agent traffic.
-- Script mode for non-interactive runs (`--script session.txt`).
-- Optional auto-approval pass-through via `--dangerous/--no-dangerous`.
-- Zero third-party dependencies (Python 3.10+).
+- Batch execution mode for scripted runs (`--script session.txt`).
+- Optional auto-approval pass-through via `--dangerous` / `--no-dangerous`.
+- Zero third-party Python dependencies (Python 3.10+).
 
-## Quick Start
+## Requirements
+
+- Python 3.10 or newer.
+- A local Codex checkout (point `--codex-path` at its root).
+
+## Quick Start (Interactive)
 
 ```bash
 python3 codex_hub_cli.py \
@@ -18,13 +23,40 @@ python3 codex_hub_cli.py \
   --seed "Plan work for project X"
 ```
 
-Then type free-form messages for the orchestrator or commands such as `:spawn coder Build the thing`.
+Type free-form prompts for the orchestrator, or use colon commands to drive agents. For example:
 
-Batch execution:
+```
+:spawn coder Set up a pytest suite for the repo
+:send coder Please generate a minimal test for foo.py
+:agents
+:stderr coder 50
+:tail coder
+:tail off
+:close coder
+:quit
+```
+
+## Batch Mode From a Script
+
+Prepare a command/script file:
+
+```bash
+cat > session.txt <<'EOF_SCRIPT'
+hello orchestrator
+:spawn analyst Audit dependencies for security issues
+:send analyst Start with top 10 packages
+:agents
+:quit
+EOF_SCRIPT
+```
+
+Run the script non-interactively:
 
 ```bash
 python3 codex_hub_cli.py --codex-path /path/to/codex --script session.txt
 ```
+
+Each line is fed to the orchestrator exactly as if typed in the REPL, letting you automate routine playbooks.
 
 ## Repository Layout
 
