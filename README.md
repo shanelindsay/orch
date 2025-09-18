@@ -5,7 +5,7 @@ CLI-first orchestration hub for Codex agents. It reuses `codex proto` subprocess
 ## Features
 
 - Terminal-native REPL with colon-prefixed commands (`:help`, `:agents`, `:spawn`, `:tail`, etc.).
-- Colourised event stream showing orchestrator ↔ agent traffic.
+- Colourised, column-aligned event stream with grouped control payloads and optional state feed.
 - Batch execution mode for scripted runs (`--script session.txt`).
 - Optional auto-approval pass-through via `--dangerous` / `--no-dangerous`.
 - Zero third-party Python dependencies (Python 3.10+).
@@ -32,9 +32,12 @@ Type free-form prompts for the orchestrator, or use colon commands to drive agen
 :stderr coder 50
 :tail coder
 :tail off
+:statefeed off
 :close coder
 :quit
 ```
+
+Use `:statefeed on|off` to control whether state change notifications appear in the event stream.
 
 ## Batch Mode From a Script
 

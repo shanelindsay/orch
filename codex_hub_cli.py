@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import os
+import subprocess
 import sys
 import threading
 from typing import Optional
@@ -72,6 +73,7 @@ HELP = """Commands (prefix : ; free text goes to orchestrator)\n""" "\n" \
     "  :close <name>          Close a sub-agent\n" \
     "  :stderr <name> [N]     Show last N stderr lines (default 100)\n" \
     "  :tail <name|off>       Follow stderr until :tail off or Ctrl+C\n" \
+    "  :statefeed on|off      Toggle live state change events\n" \
     "  :quit | :exit          Quit\n" \
     "Examples:\n" \
     "  hello world            (to orchestrator)\n" \
@@ -79,17 +81,102 @@ HELP = """Commands (prefix : ; free text goes to orchestrator)\n""" "\n" \
     "  :send coder Run tests\n"
 
 
+def _git_cmd(path: str, args: list[str]) -> str:
+    """Run a git command within ``path`` and return stripped stdout."""
+    cmd = ["git", "-C", path, *args]
+    return subprocess.run(cmd, capture_output=True, check=True, text=True).stdout.strip()
+
+
+def detect_git_context(path: str) -> Optional[dict[str, Optional[str]]]:
+    """Return git repo metadata if ``path`` is inside a repository."""
+    try:
+        root = _git_cmd(path, ["rev-parse", "--show-toplevel"])
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        return None
+
+    info: dict[str, Optional[str]] = {
+        "root": root,
+        "name": os.path.basename(root) or root,
+    }
+
+    try:
+        branch = _git_cmd(path, ["rev-parse", "--abbrev-ref", "HEAD"])
+        info["branch"] = branch if branch != "HEAD" else None
+    except subprocess.CalledProcessError:
+        info["branch"] = None
+
+    try:
+        info["commit"] = _git_cmd(path, ["rev-parse", "--short", "HEAD"])
+    except subprocess.CalledProcessError:
+        info["commit"] = None
+
+    return info
+
+
+def print_startup_context() -> None:
+    """Print the current working directory and git info if available."""
+    cwd = os.getcwd()
+    print(f"Current directory: {cwd}")
+
+    git_info = detect_git_context(cwd)
+    if not git_info:
+        return
+
+    parts: list[str] = []
+    branch = git_info.get("branch")
+    commit = git_info.get("commit")
+
+    if branch:
+        parts.append(f"branch {branch}")
+    else:
+        parts.append("detached HEAD")
+
+    if commit:
+        parts.append(f"commit {commit}")
+
+    details = ", ".join(parts)
+    print(f"Git repo: {git_info['name']} ({details})")
+
+
 class Printer:
     """Pretty-printer for hub events."""
+
+    PREFIX_LABEL_WIDTH = 18
 
     def __init__(self, palette: Palette) -> None:
         self.p = palette
         self.tail_agent: Optional[str] = None
+        self.show_state_events = True
+        self._last_states: dict[str, Optional[str]] = {}
 
-    def line(self, prefix: str, text: str, colour: str) -> None:
-        if text and not text.endswith("\n"):
-            text = text + "\n"
-        sys.stdout.write(f"{self.p.c(colour)}{prefix}{self.p.r()} {text}")
+    def _format_lines(self, text: str) -> list[str]:
+        if not text:
+            return [""]
+        stripped = text.lstrip()
+        if stripped.startswith("```control"):
+            return self._format_control_block(text)
+        return text.splitlines()
+
+    @staticmethod
+    def _format_control_block(text: str) -> list[str]:
+        lines = text.splitlines() or [""]
+        formatted = ["control payload:"]
+        formatted.extend(f"    {line}" for line in lines)
+        return formatted
+
+    def line(self, seq: int, label: str, text: str, colour: str, system: bool = False) -> None:
+        colour_key = "muted" if system else colour
+        label = label.strip()
+        label = label[: self.PREFIX_LABEL_WIDTH]
+        seq_str = f"{self.p.c('muted')}[{seq:03d}]{self.p.r()}"
+        label_str = f"{self.p.c(colour_key)}{label:<{self.PREFIX_LABEL_WIDTH}}{self.p.r()}"
+        prefix = f"{seq_str} {label_str}"
+        indent = " " * len(prefix)
+
+        for idx, body in enumerate(self._format_lines(text)):
+            prefix_out = prefix if idx == 0 else indent
+            body_str = f"{self.p.c(colour_key)}{body}{self.p.r()}" if body else ""
+            sys.stdout.write(f"{prefix_out} {body_str}\n")
         sys.stdout.flush()
 
     def event(self, ev: dict) -> None:
@@ -98,30 +185,51 @@ class Printer:
         who = ev.get("who")
         etype = ev.get("type")
 
+        if seq is None:
+            return
+
         if etype == "user_to_orch":
-            self.line(f"[{seq}] You → ORCH:", payload.get("text", ""), "you")
+            self.line(seq, "You→ORCH", payload.get("text", ""), "you")
         elif etype == "orch_to_user":
-            self.line(f"[{seq}] ORCH → You:", payload.get("text", ""), "orch")
+            self.line(seq, "ORCH→You", payload.get("text", ""), "orch")
         elif etype == "orch_to_agent":
             agent = payload.get("agent", "?")
             action = (payload.get("action") or "").upper()
-            self.line(f"[{seq}] ORCH → {agent} [{action}]:", payload.get("text", ""), "agent")
+            headline = f"ORCH→{agent}"[: self.PREFIX_LABEL_WIDTH]
+            text = payload.get("text", "")
+            if action:
+                text = f"[{action}] {text}" if text else f"[{action}]"
+            self.line(seq, headline, text, "agent")
         elif etype == "agent_to_orch":
-            self.line(f"[{seq}] {who} → ORCH:", payload.get("text", ""), "agent")
+            self.line(seq, f"{who}→ORCH", payload.get("text", ""), "agent")
         elif etype == "task_started":
             msg = payload.get("text") or "Working"
-            self.line(f"[{seq}] {who} working:", msg, "work")
+            subject = who or "task"
+            self.line(seq, "status", f"{subject}: {msg}", "work", system=True)
         elif etype == "error":
             msg = payload.get("message") or "Unknown error"
-            self.line(f"[{seq}] {who} ERROR:", msg, "err")
+            self.line(seq, f"{who} error", msg, "err")
         elif etype == "agent_state":
-            agent = payload.get("agent")
-            state = payload.get("state")
-            self.line(f"[{seq}] state:", f"{agent} -> {state}", "muted")
+            if not self.show_state_events:
+                return
+            agent = payload.get("agent", "?")
+            state = payload.get("state", "unknown")
+            previous = self._last_states.get(agent)
+            if previous is None:
+                indicator = "•"
+            elif previous == state:
+                indicator = "="
+            else:
+                indicator = "→"
+            self._last_states[agent] = state
+            body = f"{agent} {indicator} {state}"
+            self.line(seq, "state", body, "muted", system=True)
         elif etype == "agent_added":
-            self.line(f"[{seq}] added:", payload.get("agent", ""), "ok")
+            agent = payload.get("agent", "")
+            self.line(seq, "agents", f"added {agent}", "ok", system=True)
         elif etype == "agent_removed":
-            self.line(f"[{seq}] removed:", payload.get("agent", ""), "warn")
+            agent = payload.get("agent", "")
+            self.line(seq, "agents", f"removed {agent}", "warn", system=True)
         elif etype == "agent_stderr":
             if self.tail_agent and who == self.tail_agent:
                 sys.stderr.write(payload.get("line", "") + "\n")
@@ -235,6 +343,16 @@ async def handle_command(hub: Hub, printer: Printer, raw: str) -> bool:
         print(f"Tailing stderr for {target}. Use :tail off to stop or Ctrl+C.")
         return True
 
+    if cmd == "statefeed":
+        if not args or args[0].lower() not in {"on", "off"}:
+            print("Usage: :statefeed on|off")
+            return True
+        enabled = args[0].lower() == "on"
+        printer.show_state_events = enabled
+        status = "enabled" if enabled else "disabled"
+        print(f"State change events {status}.")
+        return True
+
     print(f"Unknown command: {cmd}. Try :help")
     return True
 
@@ -259,6 +377,8 @@ async def run_cli(args: argparse.Namespace) -> None:
     colours_enabled = sys.stdout.isatty() and (not args.no_colour)
     palette = Palette(enabled=colours_enabled)
     printer = Printer(palette)
+
+    print_startup_context()
 
     hub = Hub(codex_path=args.codex_path, dangerous=bool(args.dangerous), default_cwd=args.cwd, model=args.model)
     await hub.start(seed_text=args.seed)
