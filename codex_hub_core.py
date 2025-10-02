@@ -228,6 +228,8 @@ class Hub:
         self._sequence = 0
         self.agent_state: Dict[str, str] = {"orchestrator": "idle"}
         self._stderr_buf: Dict[str, deque[str]] = defaultdict(lambda: deque(maxlen=500))
+        self.autopilot_enabled: bool = True
+        self._autopilot_warned: bool = False
 
     async def start(self, seed_text: str) -> None:
         await self.orch.start()
@@ -240,6 +242,7 @@ class Hub:
         self.tasks.append(asyncio.create_task(self._pump_stderr(self.orch)))
         await self._broadcast({"who": "orchestrator", "type": "agent_added", "payload": {"agent": "orchestrator"}})
         await self._broadcast({"who": "orchestrator", "type": "agent_state", "payload": {"agent": "orchestrator", "state": "idle"}})
+        await self._broadcast({"who": "hub", "type": "autopilot_state", "payload": {"enabled": self.autopilot_enabled}})
 
     async def stop(self) -> None:
         if self._stopping:
@@ -250,6 +253,18 @@ class Hub:
         await self.orch.stop()
         for agent in list(self.subs.values()):
             await agent.stop()
+
+    async def set_autopilot(self, enabled: bool) -> None:
+        if self.autopilot_enabled == enabled:
+            return
+        self.autopilot_enabled = enabled
+        self._autopilot_warned = False
+        await self._broadcast({"who": "hub", "type": "autopilot_state", "payload": {"enabled": enabled}})
+        state_text = "enabled" if enabled else "disabled"
+        try:
+            await self.orch.send_text(f"HUB: autopilot {state_text} by human controller.")
+        except Exception:
+            pass
 
     async def _set_state(self, agent: str, state: str) -> None:
         prev = self.agent_state.get(agent)
@@ -315,6 +330,25 @@ class Hub:
             return
         text = msg.get("message") or msg.get("content") or ""
         for block in extract_control_blocks(text):
+            if not self.autopilot_enabled:
+                summary = next(iter(block), "unknown")
+                await self._broadcast(
+                    {
+                        "who": "orchestrator",
+                        "type": "autopilot_suppressed",
+                        "payload": {"summary": summary, "control": block},
+                    }
+                )
+                if not self._autopilot_warned:
+                    try:
+                        await self.orch.send_text(
+                            "HUB: autopilot is currently disabled; ignoring control blocks. "
+                            "Use :autopilot on to allow automated actions."
+                        )
+                    except Exception:
+                        pass
+                    self._autopilot_warned = True
+                continue
             if "spawn" in block:
                 spec = block["spawn"]
                 name = spec.get("name")
@@ -354,22 +388,24 @@ class Hub:
             await self._set_state(name, "error")
 
     async def _autoapprove(self, who: str, msg: Dict[str, Any], kind: str) -> None:
-        if not self.dangerous:
-            return
         child = self.orch if who == "orchestrator" else self.subs.get(who)
         if not child or not child.proc or not child.proc.stdin:
             return
         call_id = msg.get("call_id") or msg.get("id")
         op_type = "exec_approval" if kind == "exec" else "patch_approval"
+        approved = self.dangerous and self.autopilot_enabled
+        reason = "Auto-approved by hub" if approved else "Autopilot disabled"
+        if not self.dangerous and self.autopilot_enabled:
+            reason = "Dangerous mode disabled"
         approval = {
             "id": new_id(),
             "op": {
                 "type": op_type,
                 "call_id": call_id,
                 "id": call_id,
-                "approved": True,
-                "reason": "Auto-approved by hub",
-                "decision": "approved",
+                "approved": approved,
+                "reason": reason,
+                "decision": "approved" if approved else "denied",
             },
         }
         child.proc.stdin.write((jdump(approval) + "\n").encode())
