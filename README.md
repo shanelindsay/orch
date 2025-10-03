@@ -1,14 +1,17 @@
 # orch
 
-CLI-first orchestration hub for Codex agents. **Now uses `codex app-server`** over STDIO,
-so one long-lived server powers many conversations ("sub-agents"). Same REPL and batch driver,
-no extra services required. Adds a scheduler/watchdog, GitHub poller, and optional OTEL heartbeats.
+CLI-first orchestration hub for Codex agents. **Now uses `codex app-server`** to host a
+long-lived orchestrator and individual sub-agent conversations. The hub composes
+Decision-Ready Digests (DRDs), executes returned control blocks, and keeps everything in one REPL.
 
 ## Features
 
 - Terminal-native REPL with colon-prefixed commands (`:help`, `:agents`, `:spawn`, `:tail`, etc.).
 - Colourised, column-aligned event stream with grouped control payloads and optional state feed.
 - Batch execution mode for scripted runs (`--script session.txt`).
+- Orchestrator decision loop with debounced digests and a simple watchdog.
+- New controls: `status` (post a human-readable update) and `fetch` (pull artifacts/diffs/logs on demand).
+- Tiny append-only artifact store so sub-agent updates can be fetched without flooding context.
 - Optional auto-approval pass-through via `--dangerous` / `--no-dangerous`.
 - Runtime autopilot toggle (`:autopilot on|off`) to decide whether orchestrator control blocks run automatically.
 - GitHub helpers that treat Issues as charters (`:issue`, `:issue-prompt`, `:issue-list`, `:gh-issue`, `:gh-pr`).
@@ -51,6 +54,27 @@ Type free-form prompts for the orchestrator, or use colon commands to drive agen
 ```
 
 Use `:statefeed on|off` to control whether state change notifications appear in the event stream.
+
+## Orchestrator controls the hub (new)
+
+The orchestrator replies to DRDs with normal prose plus fenced blocks labelled ```control``` containing JSON:
+
+```
+{"spawn":{"name":"iss-128","task":"Investigate failing tests","cwd":null}}
+{"send":{"to":"iss-128","task":"Open a Draft PR referencing #128 with repro"}}
+{"close":{"agent":"iss-128"}}
+{"status":{"issue":128,"text":"Draft PR requested; implementing lock next."}}
+{"fetch":{"artifact":"a1b2c3","max_chars":4000}}
+```
+
+The hub executes these immediately when autopilot is enabled. Any `fetch` payload is attached to the next digest,
+letting the orchestrator pull detail on demand without flooding its context window.
+
+## Operator commands (new)
+
+- `:decide`  flush the digest debounce and send a Decision-Ready Digest now
+- `:wip`     show active agents with last check-ins and budgets
+- `:recent`  show the decision log (last 20 decisions)
 
 ## GitHub Issue Helpers
 
@@ -152,3 +176,4 @@ service:
 ```
 
 Run the hub with `--otel-log /tmp/codex-otel.jsonl` to enable heartbeats from OTEL.
+
