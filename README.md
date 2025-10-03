@@ -20,7 +20,7 @@ no extra services required. Adds a scheduler/watchdog, GitHub poller, and option
 ## Requirements
 
 - Python 3.10 or newer.
-- Codex CLI with `codex app-server` (with `--stdio`) available on PATH (point `--codex-path` if needed).
+- Codex CLI with `codex app-server` available on PATH (point `--codex-path` if needed).
 - GitHub CLI (`gh`) authenticated for your repository when you use GitHub helpers.
 
 ## Quick Start (Interactive)
