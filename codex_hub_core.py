@@ -51,8 +51,6 @@ ASSISTANT_METHODS = {
 }
 TASK_STARTED_METHODS = {"task_started", "status", "progress_started"}
 TASK_COMPLETE_METHODS = {"task_complete", "progress_complete"}
-EXEC_APPROVAL_METHODS = {"exec_approval_request", "execute_approval_request"}
-PATCH_APPROVAL_METHODS = {"apply_patch_approval_request", "patch_approval_request"}
 
 
 def strip_control_blocks(text: str) -> str:
@@ -133,7 +131,11 @@ class Hub:
         self.default_cwd = default_cwd
         self.model = model
 
-        self.app = AppServerProcess(codex_bin=codex_path, cwd=default_cwd or os.getcwd())
+        self.app = AppServerProcess(
+            codex_bin=codex_path,
+            cwd=default_cwd or os.getcwd(),
+            dangerous=dangerous,
+        )
         self.orchestrator: Optional[Agent] = None
         self.subs: Dict[str, Agent] = {}
         self._conv_to_name: Dict[str, str] = {}
@@ -230,6 +232,11 @@ class Hub:
                     method = (event.get("method") or "").lower()
                     params = event.get("params") or {}
                     await self._handle_notification(method, params)
+                elif kind == "request":
+                    method = event.get("method") or ""
+                    params = event.get("params") or {}
+                    request_id = event.get("id")
+                    await self._handle_request(method, params, request_id)
                 elif kind == "stderr":
                     line = event.get("line", "")
                     self._stderr_buf["app-server"].append(line)
@@ -251,6 +258,10 @@ class Hub:
             await self._broadcast({"who": "app-server", "type": "info", "payload": {"message": "session configured", "raw": params}})
             return
 
+        if low.startswith("codex/event/"):
+            await self._handle_codex_event(low, params)
+            return
+
         if low in ASSISTANT_METHODS:
             await self._handle_assistant_message(params)
             return
@@ -270,19 +281,91 @@ class Hub:
                 await self._handle_sub_complete(target, final)
             return
 
-        if low in EXEC_APPROVAL_METHODS:
-            await self._autoapprove(params, kind="exec")
-            return
-
-        if low in PATCH_APPROVAL_METHODS:
-            await self._autoapprove(params, kind="patch")
-            return
-
         if low == "error":
             await self._broadcast({"who": self._name_for_params(params) or "app-server", "type": "error", "payload": params})
             return
 
         await self._broadcast({"who": "app-server", "type": "misc", "payload": {"method": method, "params": params}})
+
+    async def _handle_request(self, method: str, params: Dict[str, Any], request_id: Any) -> None:
+        if request_id is None:
+            return
+        low = method.lower()
+        if low in {"execcommandapproval", "applypatchapproval"}:
+            await self._autoapprove(request_id, method, params)
+            return
+        await self.app.respond_error(request_id, -32601, f"Unhandled request: {method}")
+
+    async def _handle_codex_event(self, method: str, params: Dict[str, Any]) -> None:
+        msg = params.get("msg") or {}
+        msg_type = (msg.get("type") or "").lower()
+        conv_id = str(
+            params.get("conversation_id")
+            or params.get("conversationId")
+            or params.get("session_id")
+            or params.get("sessionId")
+            or ""
+        )
+
+        if msg_type == "agent_message":
+            text = self._extract_codex_message_text(msg.get("message"))
+            if not text:
+                return
+            await self._handle_assistant_message({"text": text, "conversation_id": conv_id})
+            return
+
+        if msg_type == "task_started":
+            target = self._name_for_params({"conversation_id": conv_id}) or "agent"
+            message = msg.get("message") or msg.get("status") or "Working"
+            await self._broadcast({"who": target, "type": "task_started", "payload": {"text": message}})
+            await self._set_state(target, "working")
+            return
+
+        if msg_type == "task_complete":
+            target = self._name_for_params({"conversation_id": conv_id}) or "agent"
+            await self._set_state(target, "idle")
+            final = msg.get("last_agent_message") or msg.get("message") or ""
+            if target != "orchestrator" and final:
+                await self._handle_sub_complete(target, final)
+            return
+
+        if msg_type in {"exec_command_begin", "exec_command_end", "exec_command_output_delta"}:
+            target = self._name_for_params({"conversation_id": conv_id}) or "agent"
+            summary = msg.get("command") or msg.get("output") or msg_type.replace("_", " ")
+            await self._broadcast({"who": target, "type": "status", "payload": {"text": str(summary)}})
+            return
+
+        if msg_type in {"token_count", "agent_reasoning", "agent_reasoning_delta", "agent_reasoning_section_break"}:
+            return
+
+        await self._broadcast({"who": "app-server", "type": "misc", "payload": {"method": method, "params": params}})
+
+    def _extract_codex_message_text(self, message: Any) -> Optional[str]:
+        if isinstance(message, str):
+            return message
+        if isinstance(message, dict):
+            text = message.get("text")
+            if isinstance(text, str):
+                return text
+            content = message.get("content")
+            if isinstance(content, list):
+                parts = [
+                    item.get("text")
+                    for item in content
+                    if isinstance(item, dict) and isinstance(item.get("text"), str)
+                ]
+                return "\n".join(parts) if parts else None
+        if isinstance(message, list):
+            parts = []
+            for item in message:
+                if isinstance(item, str):
+                    parts.append(item)
+                elif isinstance(item, dict):
+                    text = item.get("text")
+                    if isinstance(text, str):
+                        parts.append(text)
+            return "\n".join(parts) if parts else None
+        return None
 
     async def _handle_assistant_message(self, params: Dict[str, Any]) -> None:
         text = self._extract_text(params)
@@ -395,24 +478,41 @@ class Hub:
             "To continue, emit CONTROL `send` or close with CONTROL `close`."
         )
 
-    async def _autoapprove(self, params: Dict[str, Any], kind: str) -> None:
+    async def _autoapprove(self, request_id: Any, method: str, params: Dict[str, Any]) -> None:
         approved = self.dangerous and self.autopilot_enabled
-        reason = "Auto-approved by hub" if approved else "Autopilot disabled"
-        if not self.dangerous and self.autopilot_enabled:
-            reason = "Dangerous mode disabled"
-        call_id = params.get("call_id") or params.get("id") or params.get("request_id")
-        payload = {
-            "call_id": call_id,
-            "id": call_id,
-            "approved": approved,
-            "reason": reason,
-            "decision": "approved" if approved else "denied",
-        }
-        method = "exec_approval" if kind == "exec" else "patch_approval"
+        decision = "approved" if approved else "denied"
+
+        description: str
+        lower = method.lower()
+        if lower == "execcommandapproval":
+            command = " ".join(params.get("command", [])) if isinstance(params.get("command"), list) else ""
+            description = f"exec command {command}".strip()
+        elif lower == "applypatchapproval":
+            description = "apply patch"
+        else:
+            description = method
+
+        denial_reason = "autopilot disabled" if not self.autopilot_enabled else "dangerous mode disabled"
+        status_text = (
+            f"HUB: auto-approved {description}."
+            if approved
+            else f"HUB: denied {description} because {denial_reason}."
+        )
+
         try:
-            await self.app.call(method, params=payload, timeout=10.0)
+            await self.app.respond(request_id, {"decision": decision})
         except Exception:
-            pass
+            return
+
+        await self._broadcast({"who": "hub", "type": "status", "payload": {"text": status_text}})
+
+        if not approved:
+            try:
+                await self._send_orch(
+                    f"HUB: denied {description} because {denial_reason}. Enable autopilot or dangerous mode to allow."
+                )
+            except Exception:
+                pass
 
     async def send_to_orchestrator(self, text: str) -> None:
         await self._broadcast({"who": "user", "type": "user_to_orch", "payload": {"text": text}})
