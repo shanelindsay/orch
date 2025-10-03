@@ -1,8 +1,8 @@
 # orch
 
 CLI-first orchestration hub for Codex agents. **Now uses `codex app-server`** over STDIO,
-so one long-lived server powers many conversations (“sub-agents”). Same REPL and batch driver,
-no extra services required.
+so one long-lived server powers many conversations ("sub-agents"). Same REPL and batch driver,
+no extra services required. Adds a scheduler/watchdog, GitHub poller, and optional OTEL heartbeats.
 
 ## Features
 
@@ -12,19 +12,25 @@ no extra services required.
 - Optional auto-approval pass-through via `--dangerous` / `--no-dangerous`.
 - Runtime autopilot toggle (`:autopilot on|off`) to decide whether orchestrator control blocks run automatically.
 - GitHub helpers that treat Issues as charters (`:issue`, `:issue-prompt`, `:issue-list`, `:gh-issue`, `:gh-pr`).
+- Scheduler/watchdog enforces WIP limits, check-ins, nudges, and time budgets without blocking the REPL.
+- GitHub poller fills capacity from `orchestrate` issues, understands simple blockers, and posts one status comment.
+- Optional OTEL heartbeats by tailing a local JSONL log for per-conversation liveness.
 - Zero third-party Python dependencies (Python 3.10+).
 
 ## Requirements
 
 - Python 3.10 or newer.
-- Codex CLI with `codex app-server` available on PATH (point `--codex-path` if needed).
+- Codex CLI with `codex app-server` (with `--stdio`) available on PATH (point `--codex-path` if needed).
+- GitHub CLI (`gh`) authenticated for your repository when you use GitHub helpers.
 
 ## Quick Start (Interactive)
 
 ```bash
 python3 codex_hub_cli.py \
   --codex-path /path/to/codex \
-  --seed "Plan work for project X"
+  --seed "Plan work for project X" \
+  --wip 3 --checkin 10m --budget 45m \
+  --otel-log /tmp/codex-otel.jsonl
 ```
 
 Type free-form prompts for the orchestrator, or use colon commands to drive agents. For example:
@@ -33,10 +39,13 @@ Type free-form prompts for the orchestrator, or use colon commands to drive agen
 :spawn coder Set up a pytest suite for the repo
 :send coder Please generate a minimal test for foo.py
 :agents
+:wip
+:plan
 :stderr coder 50
 :tail coder
 :tail off
 :statefeed off
+:summary 123
 :close coder
 :quit
 ```
@@ -80,7 +89,66 @@ Each line is fed to the orchestrator exactly as if typed in the REPL, letting yo
 
 - `codex_hub_core.py` – standalone orchestration core (no web dependencies).
 - `codex_hub_cli.py` – interactive CLI frontend.
+  - `app_server_client.py` – lightweight JSON-RPC client for `codex app-server`.
+  - `github_sync.py` – helpers for issues/PRs plus a status comment thread.
+  - `otel_tailer.py` – optional JSONL tailer to ingest OTEL logs as heartbeats.
 
 ## License
 
 MIT
+
+---
+
+## How the orchestrator and sub-agents behave (default prompts)
+
+**Orchestrator (system prompt summary)**
+
+- Treat GitHub Issues as charters: respect Goal, Acceptance, Scope, Validation.
+- Use control blocks to `spawn`, `send`, and `close` sub-agents when autopilot is enabled.
+- Keep messages concise; prefer small steps; ask for summaries and check-offs.
+- Honour WIP limits; parallelise when blockers are cleared; sequence otherwise.
+
+**Sub-agents (system prompt summary)**
+
+- Work in the given workspace; create a branch/worktree as needed.
+- Make minimal, testable changes; run tests; open a PR referencing the Issue.
+- Report succinct progress; every check-in includes the next small step.
+- On completion, map outcomes to the Issue acceptance checklist.
+
+You can customise these in `codex_hub_core.py` (`ORCHESTRATOR_SYSTEM`, `SUBAGENT_SYSTEM_TEMPLATE`).
+
+---
+
+## Optional: OTEL collector (for heartbeats)
+
+Enable OTEL in Codex and ship logs to a local JSONL file:
+
+```toml
+# ~/.config/codex/config.toml
+[otel]
+environment = "dev"
+exporter    = { otlp-http = { endpoint = "http://127.0.0.1:4318/v1/logs" } }
+log_user_prompt = true
+```
+
+Minimal collector example (sends logs to `/tmp/codex-otel.jsonl`):
+
+```yaml
+receivers:
+  otlp:
+    protocols:
+      http:
+        endpoint: 127.0.0.1:4318
+
+exporters:
+  file:
+    path: /tmp/codex-otel.jsonl
+
+service:
+  pipelines:
+    logs:
+      receivers: [otlp]
+      exporters: [file]
+```
+
+Run the hub with `--otel-log /tmp/codex-otel.jsonl` to enable heartbeats from OTEL.

@@ -6,7 +6,7 @@ import os
 import re
 import subprocess
 from dataclasses import dataclass
-from typing import Iterable, List, Optional, Sequence
+from typing import Dict, Iterable, List, Optional, Sequence
 
 __all__ = [
     "GitHubError",
@@ -18,6 +18,12 @@ __all__ = [
     "list_orchestrate_issues",
     "parse_issue_body",
     "format_issue_prompt",
+    "parse_blockers",
+    "sla_from_labels",
+    "repo_slug",
+    "ensure_status_comment",
+    "update_comment",
+    "fetch_prs_for_issue",
 ]
 
 
@@ -225,3 +231,142 @@ def format_issue_prompt(issue: IssueDetails, charter: IssueCharter) -> str:
         labels = ", ".join(sorted(issue.labels))
         lines.append(f"Labels: {labels}")
     return "\n".join(lines)
+
+
+# Blockers, SLAs, and status comment helpers
+_BLOCKERS_LABEL_RE = re.compile(r"^blocked-by:(.+)$", re.IGNORECASE)
+_ISSUE_REF_RE = re.compile(r"#(\d+)")
+_SLA_CHECKIN_RE = re.compile(r"^checkin:(\d+)([smhd])$", re.IGNORECASE)
+_SLA_BUDGET_RE = re.compile(r"^budget:(\d+)([smhd])$", re.IGNORECASE)
+
+
+def _parse_duration_to_seconds(num: int, unit: str) -> int:
+    unit = unit.lower()
+    if unit == "s":
+        return num
+    if unit == "m":
+        return num * 60
+    if unit == "h":
+        return num * 3600
+    if unit == "d":
+        return num * 86400
+    return num
+
+
+def parse_blockers(body: str, labels: List[str]) -> List[int]:
+    """Return a list of issue numbers that block this issue."""
+
+    blockers: List[int] = []
+    for lab in labels:
+        match = _BLOCKERS_LABEL_RE.match(lab.strip())
+        if not match:
+            continue
+        for ref in _ISSUE_REF_RE.findall(match.group(1)):
+            try:
+                blockers.append(int(ref))
+            except Exception:
+                continue
+
+    for raw in (body or "").splitlines():
+        text = raw.strip()
+        if not text.lower().startswith(("blocked by:", "blocked-by:")):
+            continue
+        for ref in _ISSUE_REF_RE.findall(text):
+            try:
+                blockers.append(int(ref))
+            except Exception:
+                continue
+
+    return sorted({n for n in blockers if n > 0})
+
+
+def sla_from_labels(labels: List[str]) -> Dict[str, int]:
+    """Extract check-in and budget SLAs from labels like checkin:10m, budget:45m."""
+
+    values: Dict[str, int] = {}
+    for lab in labels:
+        text = lab.strip()
+        match_checkin = _SLA_CHECKIN_RE.match(text)
+        if match_checkin:
+            values["checkin_seconds"] = _parse_duration_to_seconds(int(match_checkin.group(1)), match_checkin.group(2))
+        match_budget = _SLA_BUDGET_RE.match(text)
+        if match_budget:
+            values["budget_seconds"] = _parse_duration_to_seconds(int(match_budget.group(1)), match_budget.group(2))
+    return values
+
+
+def repo_slug(repo_path: str) -> str:
+    """Return owner/name for the repository at repo_path."""
+
+    raw = _ensure_success(_run_gh(["repo", "view", "--json", "name,owner"], cwd=repo_path), "gh repo view failed")
+    data = json.loads(raw or "{}")
+    owner = (data.get("owner") or {}).get("login") or data.get("owner") or ""
+    name = data.get("name") or ""
+    return f"{owner}/{name}".strip("/")
+
+
+def _gh_api(path: str, method: str = "GET", cwd: Optional[str] = None, fields: Optional[Dict[str, str]] = None, input_text: Optional[str] = None) -> str:
+    args = ["api", path]
+    verb = (method or "GET").upper()
+    if verb != "GET":
+        args.extend(["-X", verb])
+    if fields:
+        for key, value in fields.items():
+            args.extend(["-f", f"{key}={value}"])
+    if input_text is not None:
+        proc = subprocess.run(["gh", *args], input=input_text, cwd=cwd, text=True, capture_output=True)
+        return _ensure_success(proc, f"gh api {path} failed")
+    return _ensure_success(_run_gh(args, cwd=cwd), f"gh api {path} failed")
+
+
+def ensure_status_comment(repo_path: str, issue_number: int, marker: str = "<!-- orch:status -->") -> int:
+    """Return the id of the marker comment, creating it if needed."""
+
+    slug = repo_slug(repo_path)
+    raw = _gh_api(f"repos/{slug}/issues/{issue_number}/comments", cwd=repo_path)
+    items = json.loads(raw or "[]")
+    for item in items:
+        body = (item.get("body") or "").strip()
+        if body.startswith(marker):
+            return int(item.get("id"))
+
+    initial = f"{marker}\n\nStatus: tracking started."
+    created = _gh_api(
+        f"repos/{slug}/issues/{issue_number}/comments",
+        method="POST",
+        cwd=repo_path,
+        input_text=initial,
+    )
+    data = json.loads(created or "{}")
+    return int(data.get("id"))
+
+
+def update_comment(repo_path: str, comment_id: int, body: str) -> None:
+    slug = repo_slug(repo_path)
+    _gh_api(
+        f"repos/{slug}/issues/comments/{comment_id}",
+        method="PATCH",
+        cwd=repo_path,
+        input_text=body,
+    )
+
+
+def fetch_prs_for_issue(repo_path: str, issue_number: int) -> List[Dict]:
+    """List PRs whose title references #<issue_number>."""
+
+    query = f'in:title "#{issue_number}"'
+    raw = _ensure_success(
+        _run_gh(
+            [
+                "pr",
+                "list",
+                "--search",
+                query,
+                "--json",
+                "number,title,state,url,headRefName,baseRefName",
+            ],
+            cwd=repo_path,
+        ),
+        "gh pr list failed",
+    )
+    return json.loads(raw or "[]")

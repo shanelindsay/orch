@@ -71,6 +71,10 @@ class StdinBridge:
 HELP = """Commands (prefix : ; free text goes to orchestrator)\n""" "\n" \
     "  :help                  Show this help\n" \
     "  :agents                List agents and states\n" \
+    "  :wip                   Show WIP table (timers, budget, last event)\n" \
+    "  :recent [N]            Show last N hub events (default 50)\n" \
+    "  :plan                  Show ready vs blocked issues (from GitHub)\n" \
+    "  :summary <issue>       One-screen summary for an issue\n" \
     "  :state                 Show raw state map\n" \
     "  :say <text>            Send text to orchestrator\n" \
     "  :spawn <name> <task>   Spawn a sub-agent\n" \
@@ -294,6 +298,34 @@ async def handle_command(hub: Hub, printer: Printer, raw: str) -> bool:
         print(format_agents(hub))
         return True
 
+    if cmd == "wip":
+        print(hub.render_wip_table())
+        return True
+
+    if cmd == "recent":
+        count = 50
+        if args and args[0].isdigit():
+            count = int(args[0])
+        for line in hub.render_recent(count):
+            print(line)
+        return True
+
+    if cmd == "plan":
+        print(hub.render_plan())
+        return True
+
+    if cmd == "summary":
+        if not args:
+            print("Usage: :summary <issue-number>")
+            return True
+        try:
+            issue_number = int(args[0])
+        except ValueError:
+            print("Issue number must be an integer")
+            return True
+        print(hub.render_issue_summary(issue_number))
+        return True
+
     if cmd == "state":
         print("State:", hub.agent_state)
         return True
@@ -495,6 +527,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--model", default=None, help="Optional model override passed down to children")
     parser.add_argument("--no-colour", action="store_true", help="Disable ANSI colours")
     parser.add_argument("--script", default=None, help="Run commands from a file and exit")
+    parser.add_argument("--wip", type=int, default=3, help="Max concurrent sub-agents")
+    parser.add_argument("--checkin", default="10m", help="Default check-in interval (e.g., 10m, 30m, 1h)")
+    parser.add_argument("--budget", default="45m", help="Default time budget per task (e.g., 45m, 90m)")
+    parser.add_argument("--otel-log", default=os.environ.get("ORCH_OTEL_LOG"), help="Path to OTEL JSONL log to tail")
     return parser
 
 
@@ -509,7 +545,16 @@ async def run_cli(args: argparse.Namespace) -> None:
 
     print_startup_context()
 
-    hub = Hub(codex_path=args.codex_path, dangerous=bool(args.dangerous), default_cwd=args.cwd, model=args.model)
+    hub = Hub(
+        codex_path=args.codex_path,
+        dangerous=bool(args.dangerous),
+        default_cwd=args.cwd,
+        model=args.model,
+        wip_limit=int(args.wip),
+        default_checkin=args.checkin,
+        default_budget=args.budget,
+        otel_log_path=args.otel_log,
+    )
     await hub.start(seed_text=args.seed)
     queue = hub.subscribe()
 
