@@ -213,6 +213,9 @@ class Printer:
             self.line(seq, headline, text, "agent")
         elif etype == "agent_to_orch":
             self.line(seq, f"{who}→ORCH", payload.get("text", ""), "agent")
+        elif etype == "status":
+            msg = payload.get("text") or ""
+            self.line(seq, "status", msg, "work", system=True)
         elif etype == "task_started":
             msg = payload.get("text") or "Working"
             subject = who or "task"

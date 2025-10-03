@@ -8,27 +8,33 @@ import subprocess
 from typing import Any, AsyncIterator, Dict, Optional
 
 
-def _supports_stdio(binary: str) -> bool:
+def _supports_app_server(binary: str) -> bool:
     try:
-        result = subprocess.run(
+        subprocess.run(
             [binary, "app-server", "--help"],
             capture_output=True,
             text=True,
             timeout=5,
+            check=True,
         )
     except Exception:
         return False
-    combined = (result.stdout or "") + (result.stderr or "")
-    return "--stdio" in combined
+    return True
 
 
 class AppServerProcess:
     """Run `codex app-server` and provide a small async client over stdio."""
 
-    def __init__(self, codex_bin: str = "codex", cwd: Optional[str] = None) -> None:
+    def __init__(
+        self,
+        codex_bin: str = "codex",
+        cwd: Optional[str] = None,
+        dangerous: bool = True,
+    ) -> None:
         self.codex_bin = codex_bin
         self.cwd = cwd or os.getcwd()
-        self._stdio_supported: Optional[bool] = None
+        self.dangerous = dangerous
+        self._app_server_available: Optional[bool] = None
         self.proc: Optional[asyncio.subprocess.Process] = None
         self._events: asyncio.Queue[dict] = asyncio.Queue(maxsize=2000)
         self._id_iter = itertools.count(1)
@@ -36,14 +42,13 @@ class AppServerProcess:
         self._pump_tasks: list[asyncio.Task] = []
 
     async def start(self) -> None:
-        self._stdio_supported = _supports_stdio(self.codex_bin)
-        if not self._stdio_supported:
+        self._app_server_available = _supports_app_server(self.codex_bin)
+        if not self._app_server_available:
             raise RuntimeError(
-                "Your 'codex app-server' does not support --stdio. "
-                "Update your Codex build to a version that supports stdio transport."
+                "Unable to run 'codex app-server'; ensure the Codex CLI is installed and on PATH."
             )
 
-        args = [self.codex_bin, "app-server", "--stdio"]
+        args = [self.codex_bin, "app-server"]
         self.proc = await asyncio.create_subprocess_exec(
             *args,
             cwd=self.cwd,
@@ -95,6 +100,15 @@ class AppServerProcess:
                         future.set_result(msg)
                     else:
                         await self._events.put({"kind": "response", **msg})
+                elif "id" in msg and "method" in msg:
+                    await self._events.put(
+                        {
+                            "kind": "request",
+                            "id": msg.get("id"),
+                            "method": str(msg.get("method")),
+                            "params": msg.get("params") or {},
+                        }
+                    )
                 elif "method" in msg:
                     await self._events.put(
                         {
@@ -143,9 +157,38 @@ class AppServerProcess:
         self.proc.stdin.write((json.dumps(payload, ensure_ascii=False) + "\n").encode())
         await self.proc.stdin.drain()
         try:
-            return await asyncio.wait_for(fut, timeout=timeout)
+            response = await asyncio.wait_for(fut, timeout=timeout)
         finally:
             self._pending.pop(rid, None)
+
+        if "error" in response:
+            raise RuntimeError(f"{method} failed: {response['error']}")
+        return response
+
+    async def _write_json(self, payload: dict) -> None:
+        if not self.proc or not self.proc.stdin:
+            raise RuntimeError("app-server not started")
+        line = json.dumps(payload, ensure_ascii=False) + "\n"
+        self.proc.stdin.write(line.encode())
+        await self.proc.stdin.drain()
+
+    async def notify(self, method: str, params: Optional[dict] = None) -> None:
+        payload: dict[str, Any] = {"jsonrpc": "2.0", "method": method}
+        if params is not None:
+            payload["params"] = params
+        await self._write_json(payload)
+
+    async def respond(self, request_id: Any, result: dict) -> None:
+        await self._write_json({"jsonrpc": "2.0", "id": request_id, "result": result})
+
+    async def respond_error(self, request_id: Any, code: int, message: str) -> None:
+        await self._write_json(
+            {
+                "jsonrpc": "2.0",
+                "id": request_id,
+                "error": {"code": code, "message": message},
+            }
+        )
 
     async def initialize(
         self,
@@ -153,9 +196,12 @@ class AppServerProcess:
         version: str,
         user_agent_suffix: Optional[str] = None,
     ) -> None:
-        suffix = user_agent_suffix or f"{name}/{version}"
-        params = {"client_info": {"name": name, "version": version, "user_agent_suffix": suffix}}
+        client_info: dict[str, Any] = {"name": name, "version": version}
+        if user_agent_suffix:
+            client_info["title"] = user_agent_suffix
+        params = {"clientInfo": client_info}
         await self.call("initialize", params=params, timeout=30.0)
+        await self.notify("initialized")
 
     async def create_conversation(
         self,
@@ -164,23 +210,72 @@ class AppServerProcess:
         initial_messages: Optional[list] = None,
     ) -> str:
         params: dict[str, Any] = {}
-        if workspace:
-            params["workspace_path"] = workspace
         if model:
             params["model"] = model
-        if initial_messages:
-            params["initial_messages"] = initial_messages
-        resp = await self.call("create_conversation", params=params, timeout=30.0)
+        if workspace:
+            params["cwd"] = workspace
+        if self.dangerous:
+            params["approvalPolicy"] = "never"
+            params["sandbox"] = "danger-full-access"
+        else:
+            params["approvalPolicy"] = "on-request"
+            params["sandbox"] = "workspace-write"
+
+        resp = await self.call("newConversation", params=params, timeout=30.0)
         payload = resp.get("result") or {}
-        for key in ("conversation_id", "session_id", "id"):
-            if key in payload:
-                return str(payload[key])
-        raise RuntimeError(f"create_conversation unexpected result: {resp}")
+        conversation_id = payload.get("conversationId")
+        if not conversation_id:
+            raise RuntimeError(f"newConversation unexpected result: {resp}")
+
+        conv_id = str(conversation_id)
+
+        # Subscribe to live events so the hub receives codex/event notifications.
+        try:
+            await self.call(
+                "addConversationListener",
+                params={"conversationId": conv_id},
+                timeout=10.0,
+            )
+        except RuntimeError:
+            # Non-fatal; continue even if listener registration fails.
+            pass
+
+        if initial_messages:
+            await self.send_message(conv_id, initial_messages)
+
+        return conv_id
 
     async def send_message(self, conversation_id: str, items: list[dict]) -> dict:
+        converted_items: list[dict[str, Any]] = []
+        for item in items:
+            kind = item.get("type")
+            if kind == "text":
+                converted_items.append(
+                    {
+                        "type": "text",
+                        "data": {"text": item.get("text", "")},
+                    }
+                )
+            elif kind == "image":
+                image_url = item.get("imageUrl") or item.get("image_url")
+                converted_items.append(
+                    {
+                        "type": "image",
+                        "data": {"imageUrl": image_url},
+                    }
+                )
+            elif kind in {"local_image", "localImage"}:
+                converted_items.append(
+                    {
+                        "type": "localImage",
+                        "data": {"path": item.get("path")},
+                    }
+                )
+            else:
+                converted_items.append(dict(item))
+
         params = {
-            "conversation_id": conversation_id,
-            "session_id": conversation_id,
-            "items": items,
+            "conversationId": conversation_id,
+            "items": converted_items,
         }
-        return await self.call("send_message", params=params, timeout=600.0)
+        return await self.call("sendUserMessage", params=params, timeout=600.0)
