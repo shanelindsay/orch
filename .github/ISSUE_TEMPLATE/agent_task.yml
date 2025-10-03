@@ -1,0 +1,32 @@
+name: Agent Task
+description: A concrete, bounded task for Codex
+labels: ["track:exec"]
+body:
+  - type: input
+    id: objective
+    attributes:
+      label: Objective (one sentence)
+      placeholder: e.g., Implement metrics validation for feature X
+  - type: textarea
+    id: acceptance
+    attributes:
+      label: Acceptance checklist
+      description: These bullets will appear in the PR template
+      value: |
+        - [ ] Unit tests cover cases A, B, C
+        - [ ] Only touch src/feature_x and tests/feature_x
+        - [ ] Update README section Y
+  - type: textarea
+    id: scope
+    attributes:
+      label: Scope constraints
+      value: |
+        Only modify files under:
+        - src/feature_x/
+        - tests/feature_x/
+  - type: checkboxes
+    id: lane
+    attributes:
+      label: Lane
+      options:
+        - label: Safe-lane (docs/tests/tooling only)

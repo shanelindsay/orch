@@ -1,0 +1,16 @@
+name: Epic
+description: High-level epic with sub-issues
+labels: ["track:exec"]
+body:
+  - type: textarea
+    id: summary
+    attributes:
+      label: Summary
+  - type: textarea
+    id: tasks
+    attributes:
+      label: Sub-issues / tasks
+      description: Link child Issues or add a tasklist below
+      value: |
+        - [ ] #123
+        - [ ] #124

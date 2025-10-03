@@ -1,2 +1,6 @@
 __pycache__/
 *.py[cod]
+
+# Orchestrator local state and worktrees
+exec/state/
+worktrees/

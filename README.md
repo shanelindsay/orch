@@ -1,179 +1,59 @@
 # orch
 
-CLI-first orchestration hub for Codex agents. **Now uses `codex app-server`** to host a
-long-lived orchestrator and individual sub-agent conversations. The hub composes
-Decision-Ready Digests (DRDs), executes returned control blocks, and keeps everything in one REPL.
+GitHub-driven orchestration harness for Codex agents. The `main` branch now centers on short-lived
+`codex exec` runs that sync with GitHub Issues and PRs, while the original REPL/app-server flow
+is preserved on the `orch-classic` branch (see `docs/RUNBOOK-classic.md`).
 
-## Features
+## Why switch?
+- **Single source of truth** – Issues carry objectives, scope, and acceptance; PRs track execution and checks.
+- **Repeatable turns** – Each agent turn is a single `codex exec` invocation, resumable with `codex exec resume`.
+- **Git-native parallelism** – Worktrees per Issue keep branches isolated and easy to inspect.
+- **Automation ready** – Labels and required checks drive the state machine, including optional auto-merge for safe lanes.
 
-- Terminal-native REPL with colon-prefixed commands (`:help`, `:agents`, `:spawn`, `:tail`, etc.).
-- Colourised, column-aligned event stream with grouped control payloads and optional state feed.
-- Batch execution mode for scripted runs (`--script session.txt`).
-- Orchestrator decision loop with debounced digests and a simple watchdog.
-- New controls: `status` (post a human-readable update) and `fetch` (pull artifacts/diffs/logs on demand).
-- Tiny append-only artifact store so sub-agent updates can be fetched without flooding context.
-- Optional auto-approval pass-through via `--dangerous` / `--no-dangerous`.
-- Runtime autopilot toggle (`:autopilot on|off`) to decide whether orchestrator control blocks run automatically.
-- GitHub helpers that treat Issues as charters (`:issue`, `:issue-prompt`, `:issue-list`, `:gh-issue`, `:gh-pr`).
-- Scheduler/watchdog enforces WIP limits, check-ins, nudges, and time budgets without blocking the REPL.
-- GitHub poller fills capacity from `orchestrate` issues, understands simple blockers, and posts one status comment.
-- Optional OTEL heartbeats by tailing a local JSONL log for per-conversation liveness.
-- Zero third-party Python dependencies (Python 3.10+).
+## Prerequisites
+- `codex` CLI (authenticated)
+- GitHub CLI `gh` (authenticated with repo access)
+- `jq` and `yq` for JSON/YAML parsing
+- `git`
+- Optional: `tmux` for the dashboard helper
 
-## Requirements
+## One-time setup
+1. Copy the sample config: `cp exec/config.example.yml exec/config.yml` and adjust as needed.
+2. Create the labels listed in `docs/MIGRATION.md` (scripted examples in the same file).
+3. Ensure branch protections on `main` require the checks you care about.
+4. (Optional) Prepare two worktrees if you need to compare with the archived implementation:
+   ```bash
+   git worktree add ../orch-classic-wt orch-classic
+   git worktree add ../orch-exec-wt main
+   ```
 
-- Python 3.10 or newer.
-- Codex CLI with `codex app-server` available on PATH (point `--codex-path` if needed).
-- GitHub CLI (`gh`) authenticated for your repository when you use GitHub helpers.
+## Everyday flow
+1. Draft or refine an Issue with an acceptance checklist and scope guardrails. Apply the `ready:agent` label (add `safe-lane` if it really is docs/tests/tooling only).
+2. Run the orchestrator locally:
+   ```bash
+   ./exec/orchestrator.sh
+   ```
+3. The loop will:
+   - Create or reuse a worktree/branch named `issue/<number>`.
+   - Call `codex exec` with `--full-auto` (and `--sandbox danger-full-access` if allowed in config).
+   - Commit agent changes and open a Draft PR tied to the Issue.
+   - Flip labels from `ready:agent` → `in-progress:agent` → `pr:draft`.
+   - Promote to `checks:green` and `ready:human` (or auto-merge) once required checks succeed.
+4. Review PRs labelled `ready:human`. Safe-lane PRs auto-merge when checks stay green.
 
-## Quick Start (Interactive)
+## Safe-lane automation
+Files matching the globs in `exec/config.yml` are safe for the auto-merge lane. Add the `safe-lane` label to an Issue when it only touches docs/tests/tooling. The orchestrator will configure `gh pr merge --auto` for those PRs once checks are green.
 
-```bash
-python3 codex_hub_cli.py \
-  --codex-path /path/to/codex \
-  --seed "Plan work for project X" \
-  --wip 3 --checkin 10m --budget 45m \
-  --otel-log /tmp/codex-otel.jsonl
-```
+## Useful helpers
+- `exec/tmux_dashboard.sh` – optional tmux layout following active worktrees.
+- `docs/ARCHITECTURE.md` – side-by-side comparison of the classic vs exec models.
+- `docs/RUNBOOK-exec.md` – detailed operating guide.
+- `docs/MIGRATION.md` – migration checklist, including label creation commands.
 
-Type free-form prompts for the orchestrator, or use colon commands to drive agents. For example:
-
-```
-:spawn coder Set up a pytest suite for the repo
-:send coder Please generate a minimal test for foo.py
-:agents
-:wip
-:plan
-:stderr coder 50
-:tail coder
-:tail off
-:statefeed off
-:summary 123
-:close coder
-:quit
-```
-
-Use `:statefeed on|off` to control whether state change notifications appear in the event stream.
-
-## Orchestrator controls the hub (new)
-
-The orchestrator replies to DRDs with normal prose plus fenced blocks labelled ```control``` containing JSON:
-
-```
-{"spawn":{"name":"iss-128","task":"Investigate failing tests","cwd":null}}
-{"send":{"to":"iss-128","task":"Open a Draft PR referencing #128 with repro"}}
-{"close":{"agent":"iss-128"}}
-{"status":{"issue":128,"text":"Draft PR requested; implementing lock next."}}
-{"fetch":{"artifact":"a1b2c3","max_chars":4000}}
-```
-
-The hub executes these immediately when autopilot is enabled. Any `fetch` payload is attached to the next digest,
-letting the orchestrator pull detail on demand without flooding its context window.
-
-## Operator commands (new)
-
-- `:decide`  flush the digest debounce and send a Decision-Ready Digest now
-- `:wip`     show active agents with last check-ins and budgets
-- `:recent`  show the decision log (last 20 decisions)
-
-## GitHub Issue Helpers
-
-The CLI can call the `gh` CLI to keep Issues and PRs in sync with hub activity.
-
-- `:issue <number>` prints the Goal, Acceptance checklist, Scope notes, and Validation sections parsed from the Issue body.
-- `:issue-prompt <number>` prints the same summary **and** sends it to the orchestrator as a fresh brief.
-- `:issue-list` lists open issues labelled `orchestrate` so you can pick the next task.
-- `:gh-issue <number> <comment...>` / `:gh-pr <number> <comment...>` add quick status updates without leaving the REPL.
-
-The helpers expect `gh` to be authenticated for the repository; they respect `--cwd` (or default to the current directory).
-
-## Batch Mode From a Script
-
-Prepare a command/script file:
-
-```bash
-cat > session.txt <<'EOF_SCRIPT'
-hello orchestrator
-:spawn analyst Audit dependencies for security issues
-:send analyst Start with top 10 packages
-:agents
-:quit
-EOF_SCRIPT
-```
-
-Run the script non-interactively:
-
-```bash
-python3 codex_hub_cli.py --codex-path /path/to/codex --script session.txt
-```
-
-Each line is fed to the orchestrator exactly as if typed in the REPL, letting you automate routine playbooks.
-
-## Repository Layout
-
-- `codex_hub_core.py` – standalone orchestration core (no web dependencies).
-- `codex_hub_cli.py` – interactive CLI frontend.
-  - `app_server_client.py` – lightweight JSON-RPC client for `codex app-server`.
-  - `github_sync.py` – helpers for issues/PRs plus a status comment thread.
-  - `otel_tailer.py` – optional JSONL tailer to ingest OTEL logs as heartbeats.
+## Classic stack archived
+- Branch: `orch-classic`
+- Tag: create an annotated tag such as `classic-orch-archive` on the last classic commit for quick reference (see `docs/MIGRATION.md`).
+- Runbook: `docs/RUNBOOK-classic.md`
 
 ## License
-
 MIT
-
----
-
-## How the orchestrator and sub-agents behave (default prompts)
-
-**Orchestrator (system prompt summary)**
-
-- Treat GitHub Issues as charters: respect Goal, Acceptance, Scope, Validation.
-- Use control blocks to `spawn`, `send`, and `close` sub-agents when autopilot is enabled.
-- Keep messages concise; prefer small steps; ask for summaries and check-offs.
-- Honour WIP limits; parallelise when blockers are cleared; sequence otherwise.
-
-**Sub-agents (system prompt summary)**
-
-- Work in the given workspace; create a branch/worktree as needed.
-- Make minimal, testable changes; run tests; open a PR referencing the Issue.
-- Report succinct progress; every check-in includes the next small step.
-- On completion, map outcomes to the Issue acceptance checklist.
-
-You can customise these in `codex_hub_core.py` (`ORCHESTRATOR_SYSTEM`, `SUBAGENT_SYSTEM_TEMPLATE`).
-
----
-
-## Optional: OTEL collector (for heartbeats)
-
-Enable OTEL in Codex and ship logs to a local JSONL file:
-
-```toml
-# ~/.config/codex/config.toml
-[otel]
-environment = "dev"
-exporter    = { otlp-http = { endpoint = "http://127.0.0.1:4318/v1/logs" } }
-log_user_prompt = true
-```
-
-Minimal collector example (sends logs to `/tmp/codex-otel.jsonl`):
-
-```yaml
-receivers:
-  otlp:
-    protocols:
-      http:
-        endpoint: 127.0.0.1:4318
-
-exporters:
-  file:
-    path: /tmp/codex-otel.jsonl
-
-service:
-  pipelines:
-    logs:
-      receivers: [otlp]
-      exporters: [file]
-```
-
-Run the hub with `--otel-log /tmp/codex-otel.jsonl` to enable heartbeats from OTEL.
-

@@ -1,0 +1,11 @@
+{
+  "type": "object",
+  "properties": {
+    "status": { "type": "string", "enum": ["ok", "needs_changes", "blocked"] },
+    "risks":  { "type": "array", "items": { "type": "string" } },
+    "files_touched": { "type": "array", "items": { "type": "string" } },
+    "next_actions": { "type": "array", "items": { "type": "string" } }
+  },
+  "required": ["status"],
+  "additionalProperties": false
+}

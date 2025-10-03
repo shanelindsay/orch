@@ -1,0 +1,25 @@
+# Orchestrator config (copy to exec/config.yml and edit)
+poll_interval_seconds: 20
+max_parallel_issues: 3
+base_branch: main
+worktrees_root: worktrees
+
+labels:
+  ready: ready:agent
+  in_progress: in-progress:agent
+  pr_draft: pr:draft
+  checks_green: checks:green
+  ready_human: ready:human
+  safe_lane: safe-lane
+
+safe_lane_globs:
+  - "docs/**"
+  - "README.md"
+  - "tests/**"
+  - ".github/**"
+  - "tooling/**"
+
+codex:
+  allow_edits: true          # adds --full-auto
+  allow_network: false       # if true, adds --sandbox danger-full-access
+  model: gpt-5-codex         # adjust as needed
