@@ -12,6 +12,11 @@ from typing import Optional
 
 from codex_hub_core import Hub, install_signal_handlers
 
+try:
+    import github_sync
+except ImportError:  # pragma: no cover - optional dependency
+    github_sync = None
+
 
 class Palette:
     """Simple colour palette manager with optional ANSI output."""
@@ -73,6 +78,12 @@ HELP = """Commands (prefix : ; free text goes to orchestrator)\n""" "\n" \
     "  :close <name>          Close a sub-agent\n" \
     "  :stderr <name> [N]     Show last N stderr lines (default 100)\n" \
     "  :tail <name|off>       Follow stderr until :tail off or Ctrl+C\n" \
+    "  :autopilot on|off      Toggle acting on control blocks / approvals\n" \
+    "  :issue <num>           Show Goal/Acceptance/Scope/Validation for issue\n" \
+    "  :issue-prompt <num>    Send issue summary to orchestrator\n" \
+    "  :issue-list            List open issues labelled 'orchestrate'\n" \
+    "  :gh-issue <num> <text> Comment on GitHub issue via gh CLI\n" \
+    "  :gh-pr <num> <text>    Comment on GitHub PR via gh CLI\n" \
     "  :statefeed on|off      Toggle live state change events\n" \
     "  :quit | :exit          Quit\n" \
     "Examples:\n" \
@@ -230,6 +241,14 @@ class Printer:
         elif etype == "agent_removed":
             agent = payload.get("agent", "")
             self.line(seq, "agents", f"removed {agent}", "warn", system=True)
+        elif etype == "autopilot_state":
+            enabled = bool(payload.get("enabled"))
+            status = "ENABLED" if enabled else "DISABLED"
+            colour = "ok" if enabled else "warn"
+            self.line(seq, "autopilot", status, colour, system=True)
+        elif etype == "autopilot_suppressed":
+            summary = payload.get("summary", "control")
+            self.line(seq, "autopilot", f"Suppressed {summary}", "warn", system=True)
         elif etype == "agent_stderr":
             if self.tail_agent and who == self.tail_agent:
                 sys.stderr.write(payload.get("line", "") + "\n")
@@ -237,7 +256,7 @@ class Printer:
 
 
 def format_agents(hub: Hub) -> str:
-    names = ["orchestrator"] + sorted(hub.subs.keys())
+    names = ["app-server", "orchestrator"] + sorted(hub.subs.keys())
     parts = []
     for name in names:
         state = hub.agent_state.get(name, "unknown")
@@ -252,8 +271,7 @@ async def handle_command(hub: Hub, printer: Printer, raw: str) -> bool:
 
     is_cmd = text[0] in {":", "/", "."}
     if not is_cmd:
-        await hub._broadcast({"who": "user", "type": "user_to_orch", "payload": {"text": text}})
-        await hub.orch.send_text(text)
+        await hub.send_to_orchestrator(text)
         return True
 
     parts = text[1:].split()
@@ -282,8 +300,7 @@ async def handle_command(hub: Hub, printer: Printer, raw: str) -> bool:
             print("Usage: :say <text>")
             return True
         payload = " ".join(args)
-        await hub._broadcast({"who": "user", "type": "user_to_orch", "payload": {"text": payload}})
-        await hub.orch.send_text(payload)
+        await hub.send_to_orchestrator(payload)
         return True
 
     if cmd == "spawn":
@@ -315,7 +332,12 @@ async def handle_command(hub: Hub, printer: Printer, raw: str) -> bool:
         if not args:
             print("Usage: :stderr <name> [N]")
             return True
-        name = args[0]
+        alias = args[0]
+        name = {
+            "app": "app-server",
+            "app-server": "app-server",
+            "orch": "orchestrator",
+        }.get(alias, alias)
         count = int(args[1]) if len(args) > 1 else 100
         lines = list(hub._stderr_buf.get(name, []))[-count:]
         if not lines:
@@ -331,16 +353,120 @@ async def handle_command(hub: Hub, printer: Printer, raw: str) -> bool:
         if not args:
             print("Usage: :tail <name|off>")
             return True
-        target = args[0].lower()
+        alias = args[0].lower()
+        target = {
+            "app": "app-server",
+            "app-server": "app-server",
+            "orch": "orchestrator",
+        }.get(alias, alias)
         if target == "off":
             printer.tail_agent = None
             print("Tail off")
             return True
-        if target != "orchestrator" and target not in hub.subs:
+        if target not in {"orchestrator", "app-server"} and target not in hub.subs:
             print(f"No such agent '{target}'")
             return True
         printer.tail_agent = target
         print(f"Tailing stderr for {target}. Use :tail off to stop or Ctrl+C.")
+        return True
+
+    if cmd == "autopilot":
+        if not args or args[0].lower() not in {"on", "off"}:
+            print("Usage: :autopilot on|off")
+            return True
+        enabled = args[0].lower() == "on"
+        await hub.set_autopilot(enabled)
+        status = "ENABLED" if enabled else "DISABLED"
+        print(f"Autopilot {status}")
+        return True
+
+    if cmd == "issue-list":
+        if github_sync is None:
+            print("GitHub helpers unavailable (module import failed).")
+            return True
+        repo = hub.default_cwd or os.getcwd()
+        try:
+            issues = github_sync.list_orchestrate_issues(repo)
+        except github_sync.GitHubError as exc:
+            print(f"GitHub error: {exc}")
+            return True
+        if not issues:
+            print("No open issues with label 'orchestrate'.")
+            return True
+        print("Open orchestrate issues:")
+        for item in issues:
+            labels = ", ".join(item.labels)
+            suffix = f" [{labels}]" if labels else ""
+            print(f"  - #{item.number} {item.title} ({item.state}){suffix}")
+        return True
+
+    if cmd in {"issue", "issue-prompt", "issueprompt"}:
+        if github_sync is None:
+            print("GitHub helpers unavailable (module import failed).")
+            return True
+        if not args:
+            print("Usage: :issue <number> | :issue-prompt <number>")
+            return True
+        try:
+            issue_number = int(args[0])
+        except ValueError:
+            print("Issue number must be an integer")
+            return True
+        repo = hub.default_cwd or os.getcwd()
+        try:
+            issue = github_sync.fetch_issue(repo, issue_number)
+        except github_sync.GitHubError as exc:
+            print(f"GitHub error: {exc}")
+            return True
+        charter = github_sync.parse_issue_body(issue.body)
+        prompt = github_sync.format_issue_prompt(issue, charter)
+        print(prompt)
+        if cmd != "issue":
+            await hub.send_to_orchestrator(prompt)
+        return True
+
+    if cmd == "gh-issue":
+        if github_sync is None:
+            print("GitHub helpers unavailable (module import failed).")
+            return True
+        if len(args) < 2:
+            print("Usage: :gh-issue <number> <comment...>")
+            return True
+        try:
+            number = int(args[0])
+        except ValueError:
+            print("Issue number must be an integer")
+            return True
+        comment = " ".join(args[1:])
+        repo = hub.default_cwd or os.getcwd()
+        try:
+            github_sync.comment_issue(repo, number, comment)
+        except github_sync.GitHubError as exc:
+            print(f"GitHub error: {exc}")
+            return True
+        print(f"Commented on issue #{number}.")
+        return True
+
+    if cmd == "gh-pr":
+        if github_sync is None:
+            print("GitHub helpers unavailable (module import failed).")
+            return True
+        if len(args) < 2:
+            print("Usage: :gh-pr <number> <comment...>")
+            return True
+        try:
+            number = int(args[0])
+        except ValueError:
+            print("PR number must be an integer")
+            return True
+        comment = " ".join(args[1:])
+        repo = hub.default_cwd or os.getcwd()
+        try:
+            github_sync.comment_pr(repo, number, comment)
+        except github_sync.GitHubError as exc:
+            print(f"GitHub error: {exc}")
+            return True
+        print(f"Commented on PR #{number}.")
         return True
 
     if cmd == "statefeed":
