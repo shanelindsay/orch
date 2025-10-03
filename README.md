@@ -1,6 +1,8 @@
 # orch
 
-CLI-first orchestration hub for Codex agents. It reuses `codex proto` subprocesses for the orchestrator and any spawned sub-agents, providing an interactive REPL and a batch driver—no web UI or extra services required.
+CLI-first orchestration hub for Codex agents. **Now uses `codex app-server`** over STDIO,
+so one long-lived server powers many conversations (“sub-agents”). Same REPL and batch driver,
+no extra services required.
 
 ## Features
 
@@ -15,7 +17,7 @@ CLI-first orchestration hub for Codex agents. It reuses `codex proto` subprocess
 ## Requirements
 
 - Python 3.10 or newer.
-- A local Codex checkout (point `--codex-path` at its root).
+- Codex CLI with `codex app-server` available on PATH (point `--codex-path` if needed).
 
 ## Quick Start (Interactive)
 
@@ -50,7 +52,7 @@ The CLI can call the `gh` CLI to keep Issues and PRs in sync with hub activity.
 - `:issue-list` lists open issues labelled `orchestrate` so you can pick the next task.
 - `:gh-issue <number> <comment...>` / `:gh-pr <number> <comment...>` add quick status updates without leaving the REPL.
 
-The helpers expect `gh` to be authenticated for the repository; they respect `cwd` passed via `--cwd` (or fall back to the current directory).
+The helpers expect `gh` to be authenticated for the repository; they respect `--cwd` (or default to the current directory).
 
 ## Batch Mode From a Script
 

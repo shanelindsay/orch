@@ -256,7 +256,7 @@ class Printer:
 
 
 def format_agents(hub: Hub) -> str:
-    names = ["orchestrator"] + sorted(hub.subs.keys())
+    names = ["app-server", "orchestrator"] + sorted(hub.subs.keys())
     parts = []
     for name in names:
         state = hub.agent_state.get(name, "unknown")
@@ -271,8 +271,7 @@ async def handle_command(hub: Hub, printer: Printer, raw: str) -> bool:
 
     is_cmd = text[0] in {":", "/", "."}
     if not is_cmd:
-        await hub._broadcast({"who": "user", "type": "user_to_orch", "payload": {"text": text}})
-        await hub.orch.send_text(text)
+        await hub.send_to_orchestrator(text)
         return True
 
     parts = text[1:].split()
@@ -301,8 +300,7 @@ async def handle_command(hub: Hub, printer: Printer, raw: str) -> bool:
             print("Usage: :say <text>")
             return True
         payload = " ".join(args)
-        await hub._broadcast({"who": "user", "type": "user_to_orch", "payload": {"text": payload}})
-        await hub.orch.send_text(payload)
+        await hub.send_to_orchestrator(payload)
         return True
 
     if cmd == "spawn":
@@ -334,7 +332,12 @@ async def handle_command(hub: Hub, printer: Printer, raw: str) -> bool:
         if not args:
             print("Usage: :stderr <name> [N]")
             return True
-        name = args[0]
+        alias = args[0]
+        name = {
+            "app": "app-server",
+            "app-server": "app-server",
+            "orch": "orchestrator",
+        }.get(alias, alias)
         count = int(args[1]) if len(args) > 1 else 100
         lines = list(hub._stderr_buf.get(name, []))[-count:]
         if not lines:
@@ -350,12 +353,17 @@ async def handle_command(hub: Hub, printer: Printer, raw: str) -> bool:
         if not args:
             print("Usage: :tail <name|off>")
             return True
-        target = args[0].lower()
+        alias = args[0].lower()
+        target = {
+            "app": "app-server",
+            "app-server": "app-server",
+            "orch": "orchestrator",
+        }.get(alias, alias)
         if target == "off":
             printer.tail_agent = None
             print("Tail off")
             return True
-        if target != "orchestrator" and target not in hub.subs:
+        if target not in {"orchestrator", "app-server"} and target not in hub.subs:
             print(f"No such agent '{target}'")
             return True
         printer.tail_agent = target
@@ -414,8 +422,7 @@ async def handle_command(hub: Hub, printer: Printer, raw: str) -> bool:
         prompt = github_sync.format_issue_prompt(issue, charter)
         print(prompt)
         if cmd != "issue":
-            await hub._broadcast({"who": "user", "type": "user_to_orch", "payload": {"text": prompt}})
-            await hub.orch.send_text(prompt)
+            await hub.send_to_orchestrator(prompt)
         return True
 
     if cmd == "gh-issue":
