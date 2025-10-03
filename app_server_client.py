@@ -28,6 +28,7 @@ class AppServerProcess:
     def __init__(self, codex_bin: str = "codex", cwd: Optional[str] = None) -> None:
         self.codex_bin = codex_bin
         self.cwd = cwd or os.getcwd()
+        self._stdio_supported: Optional[bool] = None
         self.proc: Optional[asyncio.subprocess.Process] = None
         self._events: asyncio.Queue[dict] = asyncio.Queue(maxsize=2000)
         self._id_iter = itertools.count(1)
@@ -35,9 +36,14 @@ class AppServerProcess:
         self._pump_tasks: list[asyncio.Task] = []
 
     async def start(self) -> None:
-        args = [self.codex_bin, "app-server"]
-        if _supports_stdio(self.codex_bin):
-            args.append("--stdio")
+        self._stdio_supported = _supports_stdio(self.codex_bin)
+        if not self._stdio_supported:
+            raise RuntimeError(
+                "Your 'codex app-server' does not support --stdio. "
+                "Update your Codex build to a version that supports stdio transport."
+            )
+
+        args = [self.codex_bin, "app-server", "--stdio"]
         self.proc = await asyncio.create_subprocess_exec(
             *args,
             cwd=self.cwd,

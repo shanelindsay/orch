@@ -152,6 +152,17 @@ class Hub:
     async def start(self, seed_text: str) -> None:
         await self.app.start()
         await self.app.initialize(name="orch", version="0.2.0", user_agent_suffix="orch/0.2.0")
+        self.agent_state["app-server"] = "running"
+        await self._broadcast(
+            {"who": "app-server", "type": "agent_added", "payload": {"agent": "app-server"}}
+        )
+        await self._broadcast(
+            {
+                "who": "app-server",
+                "type": "agent_state",
+                "payload": {"agent": "app-server", "state": "running"},
+            }
+        )
         initial = [
             {"type": "text", "text": f"{FALLBACK_SYSTEM_PREFIX}{ORCHESTRATOR_SYSTEM}"},
             {
