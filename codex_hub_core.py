@@ -16,6 +16,8 @@ from typing import Any, Dict, List, Optional, Set
 from app_server_client import AppServerProcess
 from otel_tailer import OTELJsonlTailer
 
+import artifacts
+
 try:
     import github_sync as ghx  # type: ignore
 except Exception:  # pragma: no cover - optional dependency
@@ -129,6 +131,9 @@ class Agent:
     name: str
     conversation_id: str
     state: str = "idle"
+    last_checkin_ts: float = 0.0
+    last_artifact_id: Optional[str] = None
+    last_summary: Optional[str] = None
 
 
 @dataclass
@@ -187,6 +192,14 @@ class Hub:
         self._stderr_buf["orchestrator"]
         self.autopilot_enabled: bool = True
         self._autopilot_warned: bool = False
+        self.decide_debounce_s = 3.0
+        self._orch_dirty: Set[str] = set()
+        self._orch_extra_blocks: List[Dict[str, Any]] = []
+        self._orch_last_sent = 0.0
+        self._decision_log: deque[Dict[str, Any]] = deque(maxlen=100)
+        self.last_checkin: Dict[str, int] = {}
+        self._digest_timer: Optional[asyncio.Task] = None
+        self._watchdog_task: Optional[asyncio.Task] = None
         self._event_log: deque[str] = deque(maxlen=500)
         self.agent_meta: Dict[str, AgentMeta] = {}
         self.issue_to_agent: Dict[int, str] = {}
@@ -229,6 +242,9 @@ class Hub:
 
         self.tasks.append(asyncio.create_task(self._pump_app_events(), name="hub-events"))
         self.tasks.append(asyncio.create_task(self._scheduler(), name="hub-scheduler"))
+        watchdog = asyncio.create_task(self._watchdog_loop(), name="hub-watchdog")
+        self.tasks.append(watchdog)
+        self._watchdog_task = watchdog
         if ghx is not None:
             self.tasks.append(asyncio.create_task(self._poll_github(), name="hub-github"))
         if self.otel_log_path:
@@ -243,6 +259,8 @@ class Hub:
         await self._broadcast(
             {"who": "hub", "type": "autopilot_state", "payload": {"enabled": self.autopilot_enabled}}
         )
+        self.last_checkin["app-server"] = -1
+        self.last_checkin["orchestrator"] = -1
 
     async def stop(self) -> None:
         if self._stopping:
@@ -250,6 +268,8 @@ class Hub:
         self._stopping = True
         for task in self.tasks:
             task.cancel()
+        if self._digest_timer:
+            self._digest_timer.cancel()
         await self.app.stop()
 
     def subscribe(self) -> asyncio.Queue:
@@ -452,6 +472,21 @@ class Hub:
         agent_name = self._conv_to_name.get(conv_id)
         if agent_name:
             await self._broadcast({"who": agent_name, "type": "agent_to_orch", "payload": {"text": text}})
+            root = self.repo_path
+            art_id = None
+            try:
+                art_id = artifacts.store_text(root, "agent_message", text, meta={"agent": agent_name})
+            except Exception:
+                art_id = None
+            agent = self.subs.get(agent_name)
+            if agent:
+                summary = (text.strip().splitlines() or [""])[0][:300]
+                agent.last_artifact_id = art_id
+                agent.last_summary = summary or agent.last_summary
+                agent.last_checkin_ts = time.time()
+            self.last_checkin[agent_name] = 0
+            self._mark_dirty(agent_name)
+            await self._maybe_send_digest(reason="agent_message")
         else:
             await self._broadcast({"who": "agent", "type": "agent_to_orch", "payload": {"text": text}})
 
@@ -502,6 +537,42 @@ class Hub:
                 self._autopilot_warned = True
             return
 
+        if "status" in block:
+            spec = block["status"] or {}
+            issue = spec.get("issue")
+            text_body = (spec.get("text") or "").strip()
+            scope = f"issue#{issue}" if issue else "project"
+            await self._broadcast({"who": "hub", "type": "status_posted", "payload": {"scope": scope, "text": text_body}})
+            if ghx is not None and issue and text_body:
+                try:
+                    ghx.comment_issue(self.repo_path, int(issue), text_body)
+                except Exception:
+                    pass
+            return
+
+        if "fetch" in block:
+            spec = block["fetch"] or {}
+            art_id = spec.get("artifact")
+            max_chars_value = spec.get("max_chars")
+            try:
+                max_chars = int(max_chars_value) if max_chars_value is not None else 4000
+            except Exception:
+                max_chars = 4000
+            if art_id:
+                root = self.repo_path
+                try:
+                    body, total = artifacts.load_text(root, art_id, max_chars=max_chars)
+                    event = {"type": "ARTIFACT", "id": art_id, "chars": len(body), "total": total, "body": body}
+                    note = f"Fetched artifact {art_id} ({len(body)}/{total} chars)"
+                except Exception as exc:
+                    event = {"type": "ARTIFACT_ERROR", "id": art_id, "error": str(exc)}
+                    note = f"Artifact {art_id} not available ({exc})"
+                self._orch_extra_blocks.append(event)
+                await self._broadcast({"who": "hub", "type": "artifact_note", "payload": {"note": note}})
+                self._ensure_digest_timer()
+                await self._maybe_send_digest(reason="fetch")
+            return
+
         if "spawn" in block:
             spec = block["spawn"]
             name = spec.get("name")
@@ -550,6 +621,21 @@ class Hub:
             return
 
     async def _handle_sub_complete(self, name: str, final: str) -> None:
+        root = self.repo_path
+        art_id = None
+        try:
+            art_id = artifacts.store_text(root, "agent_complete", final, meta={"agent": name})
+        except Exception:
+            art_id = None
+        agent = self.subs.get(name)
+        if agent:
+            summary = (final.strip().splitlines() or [""])[0][:300]
+            agent.last_artifact_id = art_id
+            agent.last_summary = summary or agent.last_summary
+            agent.last_checkin_ts = time.time()
+        self.last_checkin[name] = 0
+        self._mark_dirty(name)
+        await self._maybe_send_digest(reason="agent_complete")
         await self._send_orch(
             f"Sub-agent '{name}' reports task complete.\n"
             f"Final update:\n{final}\n"
@@ -638,6 +724,9 @@ class Hub:
         await self._broadcast({"who": key, "type": "agent_added", "payload": {"agent": key}})
         await self._broadcast({"who": key, "type": "agent_state", "payload": {"agent": key, "state": "idle"}})
         await self._send_orch(f"HUB: spawned sub-agent '{key}'.")
+        self.last_checkin[key] = -1
+        self._mark_dirty(key)
+        await self._maybe_send_digest(reason="spawn")
 
     async def send_to_sub(self, name: Optional[str], task_text: str) -> None:
         key = normalise_agent_name(name)
@@ -661,6 +750,7 @@ class Hub:
         self._stderr_buf.pop(key, None)
         self._conv_to_name.pop(agent.conversation_id, None)
         self.agent_meta.pop(key, None)
+        self.last_checkin.pop(key, None)
         to_remove = [issue for issue, holder in self.issue_to_agent.items() if holder == key]
         for issue in to_remove:
             self.issue_to_agent.pop(issue, None)
@@ -673,6 +763,9 @@ class Hub:
             return
         self.agent_state[agent] = state
         await self._broadcast({"who": agent, "type": "agent_state", "payload": {"agent": agent, "state": state}})
+        if agent != "orchestrator":
+            self._mark_dirty(agent)
+            await self._maybe_send_digest(reason="state_change")
 
     async def _broadcast(self, payload: Dict[str, Any]) -> None:
         dead: List[asyncio.Queue] = []
@@ -694,6 +787,132 @@ class Hub:
                 dead.append(queue)
         for queue in dead:
             self._subscribers.discard(queue)
+
+    def _mark_dirty(self, agent: str) -> None:
+        if not agent or agent == "orchestrator":
+            return
+        self._orch_dirty.add(agent)
+        self._ensure_digest_timer()
+
+    def _ensure_digest_timer(self) -> None:
+        if self._digest_timer and not self._digest_timer.done():
+            return
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        self._digest_timer = loop.create_task(self._debounced_digest())
+
+    async def _debounced_digest(self) -> None:
+        try:
+            await asyncio.sleep(self.decide_debounce_s)
+            await self._maybe_send_digest(reason="debounce")
+        except asyncio.CancelledError:
+            pass
+        finally:
+            self._digest_timer = None
+
+    async def decide_now(self, reason: str = "manual") -> None:
+        await self._send_digest(reason=reason, force=True)
+
+    async def _maybe_send_digest(self, reason: str = "debounce") -> None:
+        if not self.orchestrator:
+            return
+        if not self._orch_dirty and not self._orch_extra_blocks:
+            return
+        now = time.time()
+        if not self._orch_last_sent or (now - self._orch_last_sent) >= self.decide_debounce_s:
+            await self._send_digest(reason=reason)
+
+    def _build_digest_text(self) -> str:
+        lines: List[str] = ["Decision-ready digest:"]
+        events: List[Dict[str, Any]] = []
+        now = time.time()
+
+        for name in sorted(self._orch_dirty):
+            agent = self.subs.get(name)
+            state = self.agent_state.get(name, "unknown")
+            summary = (agent.last_summary or "").strip() if agent else ""
+            artifact_id: Optional[str] = agent.last_artifact_id if agent else None
+            last_seconds: Optional[int] = None
+            if agent and agent.last_checkin_ts:
+                last_seconds = int(max(0, now - agent.last_checkin_ts))
+            last_text = f"{last_seconds}s" if last_seconds is not None else "n/a"
+            lines.append(f"- {name} [{state}, last check-in {last_text}]")
+            if summary:
+                lines.append(f'  "{summary}"')
+            event: Dict[str, Any] = {"type": "AGENT_UPDATE", "agent": name, "state": state}
+            meta = self.agent_meta.get(name)
+            if meta and meta.issue_number:
+                event["issue"] = meta.issue_number
+            if artifact_id:
+                event["artifacts"] = {"last_message": artifact_id}
+            events.append(event)
+
+        extra_blocks = list(self._orch_extra_blocks)
+        self._orch_extra_blocks.clear()
+
+        if len(lines) == 1:
+            lines.append("- No agent updates; awaiting check-ins.")
+
+        text = "\n".join(lines)
+        for ev in events:
+            text += "\n\n```event\n" + json.dumps(ev, ensure_ascii=False) + "\n```"
+        for extra in extra_blocks:
+            text += "\n\n```event\n" + json.dumps(extra, ensure_ascii=False) + "\n```"
+        return text
+
+
+    async def _send_digest(self, reason: str, force: bool = False) -> None:
+        if not self.orchestrator:
+            return
+        if not force and not self._orch_dirty and not self._orch_extra_blocks:
+            return
+        if self._digest_timer and not self._digest_timer.done():
+            self._digest_timer.cancel()
+        text = self._build_digest_text()
+        if not text.strip():
+            if not force:
+                return
+            text = "Decision-ready digest: (no updates)"
+        await self.app.send_message(self.orchestrator.conversation_id, items=[{"type": "text", "text": text}])
+        self._digest_timer = None
+        self._orch_last_sent = time.time()
+        record = {"ts": int(self._orch_last_sent), "who": "hub", "action": "digest_sent", "reason": reason}
+        self._decision_log.append(record)
+        await self._broadcast({"who": "hub", "type": "decision", "payload": record})
+        self._orch_dirty.clear()
+
+    def recent_decisions(self, count: int = 20) -> List[Dict[str, Any]]:
+        if count <= 0:
+            return []
+        return list(self._decision_log)[-count:]
+
+    async def _watchdog_loop(self) -> None:
+        try:
+            while not self._stopping:
+                await asyncio.sleep(5)
+                now = time.time()
+                dirty = False
+                for name, agent in list(self.subs.items()):
+                    if agent.last_checkin_ts:
+                        delta = int(max(0, now - agent.last_checkin_ts))
+                    else:
+                        delta = -1
+                    self.last_checkin[name] = delta
+                    meta = self.agent_meta.get(name)
+                    threshold = meta.checkin_seconds if meta else self.default_checkin_seconds
+                    if threshold and delta >= 0 and delta > threshold:
+                        self._orch_extra_blocks.append({
+                            "type": "TIMEOUT_CHECKIN",
+                            "agent": name,
+                            "seconds": delta,
+                        })
+                        dirty = True
+                if dirty:
+                    await self._maybe_send_digest(reason="watchdog")
+        except asyncio.CancelledError:
+            return
 
     async def _scheduler(self) -> None:
         try:

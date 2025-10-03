@@ -71,8 +71,9 @@ class StdinBridge:
 HELP = """Commands (prefix : ; free text goes to orchestrator)\n""" "\n" \
     "  :help                  Show this help\n" \
     "  :agents                List agents and states\n" \
+    "  :decide                Flush a digest to the orchestrator now\n" \
     "  :wip                   Show WIP table (timers, budget, last event)\n" \
-    "  :recent [N]            Show last N hub events (default 50)\n" \
+    "  :recent [decisions|events|N]  Show decision log (default 20) or recent events\n" \
     "  :plan                  Show ready vs blocked issues (from GitHub)\n" \
     "  :summary <issue>       One-screen summary for an issue\n" \
     "  :state                 Show raw state map\n" \
@@ -256,6 +257,22 @@ class Printer:
         elif etype == "autopilot_suppressed":
             summary = payload.get("summary", "control")
             self.line(seq, "autopilot", f"Suppressed {summary}", "warn", system=True)
+        elif etype == "decision":
+            action = payload.get("action", "")
+            reason = payload.get("reason", "")
+            who_decided = payload.get("who", "orchestrator")
+            summary = action or "decision"
+            if reason:
+                summary = f"{summary} - {reason}"
+            self.line(seq, f"{who_decided} decision", summary, "ok", system=True)
+        elif etype == "status_posted":
+            scope = payload.get("scope", "")
+            text_body = payload.get("text", "")
+            detail = f"{scope}: {text_body}" if scope else text_body
+            self.line(seq, "status", detail, "work", system=True)
+        elif etype == "artifact_note":
+            note = payload.get("note", "")
+            self.line(seq, "artifact", note, "muted", system=True)
         elif etype == "agent_stderr":
             if self.tail_agent and who == self.tail_agent:
                 sys.stderr.write(payload.get("line", "") + "\n")
@@ -264,11 +281,18 @@ class Printer:
 
 def format_agents(hub: Hub) -> str:
     names = ["app-server", "orchestrator"] + sorted(hub.subs.keys())
+    last_map = getattr(hub, "last_checkin", {}) if hasattr(hub, "last_checkin") else {}
     parts = []
     for name in names:
         state = hub.agent_state.get(name, "unknown")
-        parts.append(f"  - {name} [state: {state}]")
+        last = last_map.get(name)
+        if isinstance(last, int) and last >= 0:
+            suffix = f", last check-in {last}s"
+        else:
+            suffix = ""
+        parts.append(f"  - {name} [state: {state}{suffix}]")
     return "Agents:\n" + "\n".join(parts)
+
 
 
 async def handle_command(hub: Hub, printer: Printer, raw: str) -> bool:
@@ -298,15 +322,39 @@ async def handle_command(hub: Hub, printer: Printer, raw: str) -> bool:
         print(format_agents(hub))
         return True
 
+    if cmd == "decide":
+        await hub.decide_now(reason="operator_command")
+        print("Digest sent to orchestrator.")
+        return True
+
     if cmd == "wip":
         print(hub.render_wip_table())
         return True
 
     if cmd == "recent":
-        count = 50
+        if args and args[0].lower() in {"event", "events"}:
+            count = 50
+            if len(args) > 1 and args[1].isdigit():
+                count = int(args[1])
+            for line in hub.render_recent(count):
+                print(line)
+            return True
+        count = 20
         if args and args[0].isdigit():
             count = int(args[0])
-        for line in hub.render_recent(count):
+        records = hub.recent_decisions(count)
+        if not records:
+            print("No recorded decisions yet.")
+            return True
+        for rec in records:
+            ts = rec.get("ts")
+            who = rec.get("who", "hub")
+            action = rec.get("action", "")
+            reason = rec.get("reason", "")
+            stamp = f"[{ts}] " if ts is not None else ""
+            line = f"{stamp}{who}: {action}"
+            if reason:
+                line = f"{line} - {reason}"
             print(line)
         return True
 
