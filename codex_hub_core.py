@@ -7,17 +7,28 @@ import json
 import os
 import re
 import signal
+import time
 import uuid
 from collections import defaultdict, deque
-from collections.abc import AsyncIterator
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Set
 
 from app_server_client import AppServerProcess
+from otel_tailer import OTELJsonlTailer
+
+try:
+    import github_sync as ghx  # type: ignore
+except Exception:  # pragma: no cover - optional dependency
+    ghx = None
 
 ORCHESTRATOR_SYSTEM = (
     "You are the ORCHESTRATOR agent.\n"
     "Plan work, spin up named sub-agents (new conversations), and iterate until goals are met.\n"
+    "Treat GitHub Issues as charters: respect Goal, Acceptance, Scope, Validation.\n"
+    "When autopilot is enabled, you may emit CONTROL blocks to spawn/send/close agents.\n"
+    "Use small steps, keep progress concise, and request check-ins from sub-agents.\n"
+    "Parallelise ready tasks within WIP limits; sequence tasks that have blockers.\n"
+    "On completion, require sub-agents to map work to the Issue's Acceptance checklist and open PRs.\n"
     "Emit control blocks in replies when you want the hub to act:\n\n"
     "```control\n"
     '{"spawn":{"name":"<agent_name>","task":"<task text>","cwd":null}}\n'
@@ -33,8 +44,10 @@ ORCHESTRATOR_SYSTEM = (
 
 SUBAGENT_SYSTEM_TEMPLATE = (
     "You are a SUB-AGENT named '{name}'.\n"
+    "You work in the given workspace, creating branches and small, testable commits.\n"
     "Follow the task from the human operator. Provide succinct progress updates and, when finished,\n"
-    "give a short summary and suggested next actions."
+    "give a short summary and suggested next actions. If changes are code-related, open a PR referencing the Issue.\n"
+    "Always run tests if present. Provide check-ins with the next small step."
 )
 
 FALLBACK_SYSTEM_PREFIX = "### SYSTEM MESSAGE (treat as system role) ###\n"
@@ -118,6 +131,21 @@ class Agent:
     state: str = "idle"
 
 
+@dataclass
+class AgentMeta:
+    issue_number: Optional[int] = None
+    epic: Optional[int] = None
+    started_at: float = 0.0
+    last_event_at: float = 0.0
+    checkin_seconds: int = 600
+    budget_seconds: int = 2700
+    nudges_sent: int = 0
+    max_nudges: int = 2
+    status_comment_id: Optional[int] = None
+    workspace: Optional[str] = None
+    closing_after_budget: bool = False
+
+
 class Hub:
     def __init__(
         self,
@@ -125,15 +153,24 @@ class Hub:
         dangerous: bool = True,
         default_cwd: Optional[str] = None,
         model: Optional[str] = None,
+        wip_limit: int = 3,
+        default_checkin: str = "10m",
+        default_budget: str = "45m",
+        otel_log_path: Optional[str] = None,
     ) -> None:
         self.codex_path = codex_path
         self.dangerous = dangerous
         self.default_cwd = default_cwd
         self.model = model
+        self.repo_path = default_cwd or os.getcwd()
+        self.wip_limit = max(0, int(wip_limit))
+        self.default_checkin_seconds = self._parse_duration(default_checkin, 600)
+        self.default_budget_seconds = self._parse_duration(default_budget, 45 * 60)
+        self.otel_log_path = otel_log_path
 
         self.app = AppServerProcess(
             codex_bin=codex_path,
-            cwd=default_cwd or os.getcwd(),
+            cwd=self.repo_path,
             dangerous=dangerous,
         )
         self.orchestrator: Optional[Agent] = None
@@ -150,6 +187,13 @@ class Hub:
         self._stderr_buf["orchestrator"]
         self.autopilot_enabled: bool = True
         self._autopilot_warned: bool = False
+        self._event_log: deque[str] = deque(maxlen=500)
+        self.agent_meta: Dict[str, AgentMeta] = {}
+        self.issue_to_agent: Dict[int, str] = {}
+        self._status_cache: Dict[int, int] = {}
+        state_dir = os.path.join(self.repo_path, ".orch")
+        os.makedirs(state_dir, exist_ok=True)
+        self._state_file = os.path.join(state_dir, "state.jsonl")
 
     async def start(self, seed_text: str) -> None:
         await self.app.start()
@@ -175,9 +219,8 @@ class Hub:
                 ),
             },
         ]
-        workspace = self.default_cwd or os.getcwd()
         conv_id = await self.app.create_conversation(
-            workspace=workspace,
+            workspace=self.repo_path,
             model=self.model,
             initial_messages=initial,
         )
@@ -185,6 +228,11 @@ class Hub:
         self.agent_state["orchestrator"] = "idle"
 
         self.tasks.append(asyncio.create_task(self._pump_app_events(), name="hub-events"))
+        self.tasks.append(asyncio.create_task(self._scheduler(), name="hub-scheduler"))
+        if ghx is not None:
+            self.tasks.append(asyncio.create_task(self._poll_github(), name="hub-github"))
+        if self.otel_log_path:
+            self.tasks.append(asyncio.create_task(self._pump_otel(self.otel_log_path), name="hub-otel"))
 
         await self._broadcast(
             {"who": "orchestrator", "type": "agent_added", "payload": {"agent": "orchestrator"}}
@@ -252,6 +300,20 @@ class Hub:
                 {"who": "app-server", "type": "error", "payload": {"message": f"event pump failed: {exc}"}}
             )
 
+    async def _pump_otel(self, path: str) -> None:
+        tailer = OTELJsonlTailer(path)
+        try:
+            async for conv_id, _kind in tailer.events():
+                name = self._conv_to_name.get(conv_id)
+                if name:
+                    meta = self.agent_meta.get(name)
+                    if meta:
+                        meta.last_event_at = time.time()
+        except asyncio.CancelledError:
+            pass
+        finally:
+            tailer.stop()
+
     async def _handle_notification(self, method: str, params: Dict[str, Any]) -> None:
         low = method.lower()
         if low in {"session_configured", "sessionconfigured"}:
@@ -271,6 +333,9 @@ class Hub:
             message = params.get("message") or params.get("status") or "Working"
             await self._broadcast({"who": target, "type": "task_started", "payload": {"text": message}})
             await self._set_state(target, "working")
+            meta = self.agent_meta.get(target)
+            if meta:
+                meta.last_event_at = time.time()
             return
 
         if low in TASK_COMPLETE_METHODS:
@@ -279,6 +344,9 @@ class Hub:
             final = params.get("message") or params.get("last_agent_message") or ""
             if target != "orchestrator" and final:
                 await self._handle_sub_complete(target, final)
+            meta = self.agent_meta.get(target)
+            if meta:
+                meta.last_event_at = time.time()
             return
 
         if low == "error":
@@ -372,6 +440,11 @@ class Hub:
         if not text:
             return
         conv_id = str(params.get("conversation_id") or params.get("session_id") or "")
+        name_for_heartbeat = self._conv_to_name.get(conv_id)
+        if name_for_heartbeat:
+            meta = self.agent_meta.get(name_for_heartbeat)
+            if meta:
+                meta.last_event_at = time.time()
         if self.orchestrator and conv_id == self.orchestrator.conversation_id:
             await self._handle_orchestrator_text(text)
             await self._set_state("orchestrator", "idle")
@@ -434,6 +507,11 @@ class Hub:
             name = spec.get("name")
             task = spec.get("task") or ""
             cwd = spec.get("cwd") or self.default_cwd
+            if self.wip_limit and len(self.subs) >= self.wip_limit:
+                await self._send_orch(
+                    f"HUB: WIP limit {self.wip_limit} reached; please close an agent before spawning '{name}'."
+                )
+                return
             await self._broadcast(
                 {
                     "who": "orchestrator",
@@ -540,8 +618,9 @@ class Hub:
             {"type": "text", "text": f"{FALLBACK_SYSTEM_PREFIX}{sys_message}"},
             {"type": "text", "text": task_text},
         ]
+        workspace = cwd or self.default_cwd or os.getcwd()
         conv_id = await self.app.create_conversation(
-            workspace=cwd or self.default_cwd or os.getcwd(),
+            workspace=workspace,
             model=self.model,
             initial_messages=initial,
         )
@@ -549,6 +628,13 @@ class Hub:
         self.subs[key] = agent
         self._conv_to_name[conv_id] = key
         self.agent_state[key] = "idle"
+        self.agent_meta[key] = AgentMeta(
+            started_at=time.time(),
+            last_event_at=time.time(),
+            checkin_seconds=self.default_checkin_seconds,
+            budget_seconds=self.default_budget_seconds,
+            workspace=workspace,
+        )
         await self._broadcast({"who": key, "type": "agent_added", "payload": {"agent": key}})
         await self._broadcast({"who": key, "type": "agent_state", "payload": {"agent": key, "state": "idle"}})
         await self._send_orch(f"HUB: spawned sub-agent '{key}'.")
@@ -560,6 +646,9 @@ class Hub:
             await self._send_orch(f"HUB: no such sub-agent '{name}'.")
             return
         await self.app.send_message(agent.conversation_id, items=[{"type": "text", "text": task_text}])
+        meta = self.agent_meta.get(key)
+        if meta:
+            meta.last_event_at = time.time()
         await self._send_orch(f"HUB: forwarded instruction to '{key}'.")
 
     async def close_sub(self, name: Optional[str]) -> None:
@@ -571,6 +660,10 @@ class Hub:
         self.agent_state.pop(key, None)
         self._stderr_buf.pop(key, None)
         self._conv_to_name.pop(agent.conversation_id, None)
+        self.agent_meta.pop(key, None)
+        to_remove = [issue for issue, holder in self.issue_to_agent.items() if holder == key]
+        for issue in to_remove:
+            self.issue_to_agent.pop(issue, None)
         await self._broadcast({"who": key, "type": "agent_removed", "payload": {"agent": key}})
         await self._send_orch(f"HUB: closed sub-agent '{key}'.")
 
@@ -586,6 +679,14 @@ class Hub:
         self._sequence += 1
         event = dict(payload)
         event["seq"] = self._sequence
+        try:
+            who = event.get("who") or "?"
+            etype = event.get("type") or "?"
+            self._event_log.append(f"[{self._sequence:03d}] {who} {etype}")
+            with open(self._state_file, "a", encoding="utf-8") as handle:
+                handle.write(json.dumps(event, ensure_ascii=False) + "\n")
+        except Exception:
+            pass
         for queue in list(self._subscribers):
             try:
                 queue.put_nowait(event)
@@ -593,6 +694,235 @@ class Hub:
                 dead.append(queue)
         for queue in dead:
             self._subscribers.discard(queue)
+
+    async def _scheduler(self) -> None:
+        try:
+            while not self._stopping:
+                now = time.time()
+                for name, meta in list(self.agent_meta.items()):
+                    self._maybe_update_status_comment(name)
+                    if now - meta.last_event_at > meta.checkin_seconds and meta.nudges_sent < meta.max_nudges:
+                        await self._nudge_agent(name)
+                        meta.nudges_sent += 1
+                    if now - meta.started_at > meta.budget_seconds and not meta.closing_after_budget:
+                        await self._ask_wrap_up(name)
+                        meta.closing_after_budget = True
+                    if meta.closing_after_budget and now - meta.last_event_at > 60:
+                        await self.close_sub(name)
+                await asyncio.sleep(60.0)
+        except asyncio.CancelledError:
+            return
+
+    async def _poll_github(self) -> None:
+        if ghx is None:
+            return
+        try:
+            while not self._stopping:
+                try:
+                    issues = ghx.list_orchestrate_issues(self.repo_path, limit=50)
+                except Exception:
+                    issues = []
+                closed = {item.number for item in issues if (item.state or "").lower() == "closed"}
+                active = set(self.issue_to_agent.keys())
+                ready: List[Any] = []
+                for issue in issues:
+                    if issue.number in active or issue.number in closed:
+                        continue
+                    blockers = ghx.parse_blockers(issue.body, issue.labels)
+                    blockers = [b for b in blockers if b not in closed]
+                    if blockers:
+                        continue
+                    ready.append((issue, blockers))
+                capacity = max(0, self.wip_limit - len(self.subs)) if self.wip_limit else len(ready)
+                for issue, _ in ready[:capacity]:
+                    try:
+                        charter = ghx.parse_issue_body(issue.body)
+                        prompt = ghx.format_issue_prompt(issue, charter)
+                    except Exception:
+                        prompt = f"Work on Issue #{issue.number}: {issue.title}"
+                    prompt += (
+                        "\n\nYou have high permissions and autopilot is enabled. "
+                        "Create a small, testable branch or PR. Provide regular check-ins. "
+                        "When done, map outcomes to Acceptance and reference this issue."
+                    )
+                    name = f"iss{issue.number}"
+                    await self.spawn_sub(name, prompt, self.default_cwd)
+                    meta = self.agent_meta.get(name)
+                    if meta:
+                        sla = ghx.sla_from_labels(issue.labels)
+                        meta.issue_number = issue.number
+                        meta.checkin_seconds = int(sla.get("checkin_seconds", self.default_checkin_seconds))
+                        meta.budget_seconds = int(sla.get("budget_seconds", self.default_budget_seconds))
+                        try:
+                            comment_id = ghx.ensure_status_comment(self.repo_path, issue.number)
+                            meta.status_comment_id = comment_id
+                            self._status_cache[issue.number] = comment_id
+                        except Exception:
+                            pass
+                    self.issue_to_agent[issue.number] = name
+                await asyncio.sleep(90.0)
+        except asyncio.CancelledError:
+            return
+
+    async def _nudge_agent(self, name: str) -> None:
+        agent = self.subs.get(name)
+        if not agent:
+            return
+        message = (
+            "Quick check-in:\n"
+            "- What is the next small step?\n"
+            "- Is anything blocking you?\n"
+            "- ETA to a minimal PR or result?"
+        )
+        await self.app.send_message(agent.conversation_id, items=[{"type": "text", "text": message}])
+
+    async def _ask_wrap_up(self, name: str) -> None:
+        agent = self.subs.get(name)
+        if not agent:
+            return
+        message = (
+            "Time budget reached. Please summarise status, remaining work, and immediate next actions. "
+            "If you have a branch or partial PR, share links now."
+        )
+        await self.app.send_message(agent.conversation_id, items=[{"type": "text", "text": message}])
+
+    def _maybe_update_status_comment(self, name: str) -> None:
+        if ghx is None:
+            return
+        meta = self.agent_meta.get(name)
+        if not meta or not meta.issue_number:
+            return
+        now = time.time()
+        if (now - meta.last_event_at) < 180:
+            return
+        try:
+            comment_id = meta.status_comment_id or self._status_cache.get(meta.issue_number) or ghx.ensure_status_comment(
+                self.repo_path, meta.issue_number
+            )
+            meta.status_comment_id = comment_id
+            self._status_cache[meta.issue_number] = comment_id
+            body = self._render_status_comment(name, meta)
+            ghx.update_comment(self.repo_path, comment_id, body)
+        except Exception:
+            pass
+
+    def _render_status_comment(self, name: str, meta: AgentMeta) -> str:
+        marker = "<!-- orch:status -->"
+
+        def fmt_delta(seconds: float) -> str:
+            seconds = int(max(0, seconds))
+            if seconds >= 3600:
+                return f"{seconds // 3600}h {(seconds % 3600) // 60}m"
+            return f"{seconds // 60}m"
+
+        now = time.time()
+        elapsed = fmt_delta(now - meta.started_at)
+        since = fmt_delta(now - meta.last_event_at)
+        left = fmt_delta(max(0, meta.budget_seconds - (now - meta.started_at)))
+        conversation_id = self.subs.get(name).conversation_id if name in self.subs else ""
+        return (
+            f"{marker}\n\n"
+            f"**Agent**: `{name}`  \n"
+            f"**State**: {self.agent_state.get(name, '?')}  \n"
+            f"**Elapsed**: {elapsed}  \n"
+            f"**Last event**: {since} ago  \n"
+            f"**Budget left**: {left}  \n"
+            f"**Workspace**: `{meta.workspace or ''}`  \n"
+            f"**Conversation**: `{conversation_id}`\n"
+            "\n_Update cadence: automated by orch._"
+        )
+
+    def render_wip_table(self) -> str:
+        if not self.subs:
+            return "No active sub-agents."
+        now = time.time()
+        header = f"{'AGENT':<14} {'STATE':<10} {'ISSUE':<6} {'ELAPSED':<8} {'LAST':<8} {'BUDGET':<8} {'NUDGES':<6}"
+        lines = [header, "-" * len(header)]
+
+        def fmt_delta(value: float) -> str:
+            value = int(max(0, value))
+            if value >= 3600:
+                return f"{value // 3600}h"
+            return f"{value // 60}m"
+
+        for name in sorted(self.subs.keys()):
+            meta = self.agent_meta.get(name) or AgentMeta()
+            elapsed = fmt_delta(now - meta.started_at)
+            last = fmt_delta(now - meta.last_event_at)
+            remaining = fmt_delta(max(0, meta.budget_seconds - (now - meta.started_at)))
+            issue = str(meta.issue_number or "-")
+            lines.append(
+                f"{name:<14} {self.agent_state.get(name, '?'):<10} {issue:<6} {elapsed:<8} {last:<8} {remaining:<8} {meta.nudges_sent}/{meta.max_nudges:<6}"
+            )
+        return "\n".join(lines)
+
+    def render_recent(self, count: int = 50) -> List[str]:
+        if count <= 0:
+            return []
+        return list(self._event_log)[-count:]
+
+    def render_plan(self) -> str:
+        if ghx is None:
+            return "GitHub helpers unavailable."
+        try:
+            issues = ghx.list_orchestrate_issues(self.repo_path, limit=100)
+        except Exception as exc:
+            return f"GitHub error: {exc}"
+        closed = {issue.number for issue in issues if (issue.state or "").lower() == "closed"}
+        ready: List[str] = []
+        blocked: List[str] = []
+        for issue in issues:
+            blockers = ghx.parse_blockers(issue.body, issue.labels)
+            blockers = [b for b in blockers if b not in closed]
+            entry = f"#{issue.number} {issue.title}"
+            if blockers:
+                blocked.append(f"  - {entry} (blocked by {', '.join('#' + str(b) for b in blockers)})")
+            else:
+                ready.append(f"  - {entry}")
+        lines = ["Ready issues:"]
+        lines.extend(ready or ["  (none)"])
+        lines.append("Blocked issues:")
+        lines.extend(blocked or ["  (none)"])
+        return "\n".join(lines)
+
+    def render_issue_summary(self, issue_number: int) -> str:
+        if ghx is None:
+            return "GitHub helpers unavailable."
+        try:
+            issue = ghx.fetch_issue(self.repo_path, issue_number)
+            charter = ghx.parse_issue_body(issue.body)
+            prompt = ghx.format_issue_prompt(issue, charter)
+            prs = ghx.fetch_prs_for_issue(self.repo_path, issue_number)
+        except Exception as exc:
+            return f"GitHub error: {exc}"
+        if prs:
+            prompt += "\n\nPRs:\n" + "\n".join(
+                [
+                    f"- #{pr.get('number')} {pr.get('title')} ({pr.get('state')}) {pr.get('url')}"
+                    for pr in prs
+                ]
+            )
+        return prompt
+
+    @staticmethod
+    def _parse_duration(value: str | int | float | None, default_seconds: int) -> int:
+        if value in (None, ""):
+            return default_seconds
+        text = str(value).strip().lower()
+        try:
+            if text.endswith("ms"):
+                return max(1, int(float(text[:-2]) / 1000.0))
+            if text.endswith("s"):
+                return int(float(text[:-1]))
+            if text.endswith("m"):
+                return int(float(text[:-1]) * 60)
+            if text.endswith("h"):
+                return int(float(text[:-1]) * 3600)
+            if text.endswith("d"):
+                return int(float(text[:-1]) * 86400)
+            return int(float(text))
+        except Exception:
+            return default_seconds
 
 
 def install_signal_handlers(loop: asyncio.AbstractEventLoop, set_event: asyncio.Event) -> None:
