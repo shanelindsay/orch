@@ -7,7 +7,7 @@ import time
 import uuid
 from typing import Optional, Tuple
 
-ART_DIRNAME = "artifacts"
+ART_DIRNAME = os.path.join(".orch", "artifacts")
 INDEX_BASENAME = "index.jsonl"
 
 

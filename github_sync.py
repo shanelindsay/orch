@@ -412,9 +412,9 @@ def update_comment(repo_path: str, comment_id: int, body: str) -> None:
 
 
 def fetch_prs_for_issue(repo_path: str, issue_number: int) -> List[Dict]:
-    """List PRs whose title references #<issue_number>."""
+    """List PRs that reference #<issue_number> in title or body."""
 
-    query = f'in:title "#{issue_number}"'
+    query = f'in:title,body "#{issue_number}"'
     raw = _ensure_success(
         _run_gh(
             [
