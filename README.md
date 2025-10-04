@@ -1,8 +1,9 @@
 # orch
 
-CLI-first orchestration hub for Codex agents. **Now uses `codex app-server`** to host a
-long-lived orchestrator and individual sub-agent conversations. The hub composes
-Decision-Ready Digests (DRDs), executes returned control blocks, and keeps everything in one REPL.
+CLI-first orchestration hub for Codex agents. It can run interactively (REPL) **or** in
+**GitHub-driven mode** where GitHub Issues/PRs + labels are the only control surface.
+Under the hood we drive a single `codex app-server` process and open one conversation
+for the **orchestrator** and one per **sub-agent** (per Issue).
 
 ## Features
 
@@ -23,7 +24,7 @@ Decision-Ready Digests (DRDs), executes returned control blocks, and keeps every
 ## Requirements
 
 - Python 3.10 or newer.
-- Codex CLI with `codex app-server` available on PATH (point `--codex-path` if needed).
+- Codex CLI with `codex app-server` available on PATH (or point `--codex-path`).
 - GitHub CLI (`gh`) authenticated for your repository when you use GitHub helpers.
 
 ## Quick Start (Interactive)
@@ -54,6 +55,61 @@ Type free-form prompts for the orchestrator, or use colon commands to drive agen
 ```
 
 Use `:statefeed on|off` to control whether state change notifications appear in the event stream.
+
+## GitHub-only control flow (local; ideal for tmux on HPC)
+
+This mode polls GitHub locally and uses labels/comments as the interface. Agents run
+in local git **worktrees** and report back to Issues/PRs.
+
+### Labels (default set, configurable)
+
+* `orchestrate` — pick up this Issue
+* `agent:queued` — daemon should start/assign an agent
+* `agent:running` — agent working (set by daemon)
+* `agent:review` — PR opened and awaiting review
+* `agent:done` — work finished (Issue can be closed)
+* `agent:stalled` — no progress heartbeat within threshold
+* `auto:pr-on-complete` — open a PR automatically when task completes
+
+### Start the daemon
+
+```bash
+# inside the repo you want to orchestrate
+python3 orchestrate_github.py \
+  --codex-path codex \
+  --poll-secs 25 \
+  --dangerous \
+  --autopilot-on
+```
+
+It will:
+1) find Issues labelled `orchestrate`+`agent:queued`,
+2) create a `git worktree` and branch `ai/iss-<N>-<slug>`,
+3) spin up a sub-agent bound to that worktree,
+4) post a comment + flip labels to `agent:running`,
+5) mirror agent end-of-step reports back to the Issue, and
+6) on completion optionally open a PR and relabel to `agent:review`.
+
+> Project fields: if you want Projects to mirror labels, add a small workflow that maps
+> label -> field. A starter workflow is provided in `.github/workflows/labels-to-project.yml`
+> (edit the project/field IDs for your org).
+
+### Orchestrator & sub-agent prompts
+
+*Orchestrator.* Default system prompt: plan, spawn named sub-agents, coordinate by emitting
+`control` blocks (`spawn`, `send`, `close`; optional `exec`). It writes short human updates
+that the daemon mirrors into GitHub comments.
+
+*Sub-agents.* Default system prompt: "You are a sub-agent named X; work in this worktree and
+give succinct progress updates; end with a short summary and next actions." The daemon adds
+the Issue charter text to the initial message so each agent can work from the Issue's Goal,
+Acceptance, Scope and Validation.
+
+### Safety/approvals
+
+By default, **autopilot** is enabled when you pass `--autopilot-on`. If also `--dangerous`
+is set, the orchestrator can emit an `exec` control block and the daemon will run `git`/`gh`
+commands locally in the right worktree. Turn either off to gate command execution.
 
 ## Orchestrator controls the hub (new)
 
