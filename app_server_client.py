@@ -214,12 +214,9 @@ class AppServerProcess:
             params["model"] = model
         if workspace:
             params["cwd"] = workspace
-        if self.dangerous:
-            params["approvalPolicy"] = "never"
-            params["sandbox"] = "danger-full-access"
-        else:
-            params["approvalPolicy"] = "on-request"
-            params["sandbox"] = "workspace-write"
+        # Always request approvals so the hub can gate actions; sandbox level depends on danger.
+        params["approvalPolicy"] = "on-request"
+        params["sandbox"] = "danger-full-access" if self.dangerous else "workspace-write"
 
         resp = await self.call("newConversation", params=params, timeout=30.0)
         payload = resp.get("result") or {}

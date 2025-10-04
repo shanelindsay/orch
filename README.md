@@ -19,7 +19,7 @@ for the **orchestrator** and one per **sub-agent** (per Issue).
 - Scheduler/watchdog enforces WIP limits, check-ins, nudges, and time budgets without blocking the REPL.
 - GitHub poller fills capacity from `orchestrate` issues, understands simple blockers, and posts one status comment.
 - Optional OTEL heartbeats by tailing a local JSONL log for per-conversation liveness.
-- Zero third-party Python dependencies (Python 3.10+).
+- Core has zero third-party Python dependencies (Python 3.10+). The optional web dashboard under `hub_dashboard/` uses `aiohttp`.
 
 ## Requirements
 
@@ -127,9 +127,11 @@ Acceptance, Scope and Validation.
 
 ### Safety/approvals
 
-By default, **autopilot** is enabled when you pass `--autopilot-on`. If also `--dangerous`
-is set, the orchestrator can emit an `exec` control block and the daemon will run `git`/`gh`
-commands locally in the right worktree. Turn either off to gate command execution.
+Safety model:
+
+- `--dangerous` controls the sandbox power for conversations (danger-full-access vs. workspace-write).
+- Approvals are always requested from the app-server; the hub auto-approves only when both `--dangerous` and autopilot are enabled.
+- Use `:autopilot on|off` at runtime to toggle automatic execution of CONTROL blocks and approvals.
 
 ## Orchestrator controls the hub (new)
 
@@ -253,3 +255,4 @@ service:
 
 Run the hub with `--otel-log /tmp/codex-otel.jsonl` to enable heartbeats from OTEL.
 
+Artifacts: the hub stores text artifacts under `.orch/artifacts/` and writes a rolling event log to `.orch/state.jsonl`. The `.orch/` directory is ignored by git.

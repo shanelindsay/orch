@@ -55,7 +55,7 @@ SUBAGENT_SYSTEM_TEMPLATE = (
 
 FALLBACK_SYSTEM_PREFIX = "### SYSTEM MESSAGE (treat as system role) ###\n"
 CONTROL_BLOCK_RE = re.compile(
-    r"```(?:json\\s+)?control\\s*\n(.*?)\n```", re.DOTALL | re.IGNORECASE
+    r"```(?:json\s+)?control\s*\n(.*?)\n```", re.DOTALL | re.IGNORECASE
 )
 
 TEXT_ITEM_TYPES = {"text", "assistant_delta", "assistant_message"}
@@ -664,7 +664,7 @@ class Hub:
         )
 
     async def _autoapprove(self, request_id: Any, method: str, params: Dict[str, Any]) -> None:
-        approved = self.dangerous and self.autopilot_enabled
+        approved = bool(self.dangerous and self.autopilot_enabled)
         decision = "approved" if approved else "denied"
 
         description: str
