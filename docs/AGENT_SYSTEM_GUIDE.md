@@ -138,7 +138,7 @@ Everything is visible in GitHub: comments, labels, PRs, and branch diffs. The CL
 ## Defaults & Conventions
 
 * **Worktree layout**: `.worktrees/iss-<N>` bound to branch `ai/iss-<N>-<slug>`.
-* **Commit messages**: `iss-<N>: <summary>`; include “Refs #<N>`.
+* **Commit messages**: `iss-<N>: <summary>`; include `Refs #<N>`.
 * **End‑of‑step report** (sub‑agent template):
 
   ```
@@ -197,4 +197,3 @@ If you want Project fields to mirror labels, add a small workflow to map label �
 - **Orchestrator is still an agent.** It decides what to do next, coordinates parallel sub‑agents, and uses control blocks; the daemon executes those quickly and safely.
 - **Stall protection and recovery** are “just labels” plus a heartbeat—visible and fixable from GitHub.
 - **Reproducibility is preserved** through worktrees, branch naming, and env wrappers; artifacts are versioned.
-
