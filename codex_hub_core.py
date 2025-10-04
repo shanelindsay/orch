@@ -14,6 +14,7 @@ from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Set
 
 from app_server_client import AppServerProcess
+from local_exec import run_exec
 from otel_tailer import OTELJsonlTailer
 
 import artifacts
@@ -162,6 +163,7 @@ class Hub:
         default_checkin: str = "10m",
         default_budget: str = "45m",
         otel_log_path: Optional[str] = None,
+        github_poll: bool = True,
     ) -> None:
         self.codex_path = codex_path
         self.dangerous = dangerous
@@ -172,6 +174,7 @@ class Hub:
         self.default_checkin_seconds = self._parse_duration(default_checkin, 600)
         self.default_budget_seconds = self._parse_duration(default_budget, 45 * 60)
         self.otel_log_path = otel_log_path
+        self.github_poll = github_poll
 
         self.app = AppServerProcess(
             codex_bin=codex_path,
@@ -245,7 +248,7 @@ class Hub:
         watchdog = asyncio.create_task(self._watchdog_loop(), name="hub-watchdog")
         self.tasks.append(watchdog)
         self._watchdog_task = watchdog
-        if ghx is not None:
+        if self.github_poll and ghx is not None:
             self.tasks.append(asyncio.create_task(self._poll_github(), name="hub-github"))
         if self.otel_log_path:
             self.tasks.append(asyncio.create_task(self._pump_otel(self.otel_log_path), name="hub-otel"))
@@ -535,6 +538,24 @@ class Hub:
                     "HUB: autopilot is currently disabled; ignoring control blocks. Use :autopilot on to allow automated actions."
                 )
                 self._autopilot_warned = True
+            return
+
+        if "exec" in block:
+            if not self.dangerous:
+                await self._send_orch("HUB: exec control block ignored because dangerous mode is off.")
+                return
+            spec = block.get("exec") or {}
+            result = run_exec(spec)
+            body = (
+                f"exec> {result.cmd}\n"
+                f"cwd: {result.cwd}\n"
+                f"code: {result.code}\n\n"
+                f"stdout:\n{result.stdout}\n"
+                f"\nstderr:\n{result.stderr}"
+            )
+            await self._broadcast({"who": "orchestrator", "type": "orch_to_user", "payload": {"text": body}})
+            if not result.ok:
+                await self._send_orch(f"HUB: exec command failed with exit code {result.code}.")
             return
 
         if "status" in block:
