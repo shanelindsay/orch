@@ -24,6 +24,10 @@ __all__ = [
     "ensure_status_comment",
     "update_comment",
     "fetch_prs_for_issue",
+    "git_root",
+    "ensure_worktree",
+    "replace_labels",
+    "ensure_pr",
 ]
 
 
@@ -231,6 +235,62 @@ def format_issue_prompt(issue: IssueDetails, charter: IssueCharter) -> str:
         labels = ", ".join(sorted(issue.labels))
         lines.append(f"Labels: {labels}")
     return "\n".join(lines)
+
+
+def git_root(path: str) -> str:
+    _run_gh(["repo", "view", "--json", "nameWithOwner"], cwd=path)
+    try:
+        result = subprocess.run(
+            ["git", "-C", path, "rev-parse", "--show-toplevel"],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        return result.stdout.strip()
+    except Exception:
+        return os.path.abspath(path)
+
+
+def _run_git(args: Sequence[str], cwd: Optional[str] = None) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(["git", *args], cwd=cwd, check=False, capture_output=True, text=True)
+
+
+def ensure_worktree(root: str, branch: str, worktree_dir: str, base: str = "origin/main") -> None:
+    os.makedirs(os.path.dirname(worktree_dir), exist_ok=True)
+    _run_git(["fetch", "--all"], cwd=root)
+    check = _run_git(["rev-parse", "--verify", branch], cwd=root)
+    if check.returncode != 0:
+        _run_git(["branch", branch, base], cwd=root)
+    if not os.path.exists(worktree_dir):
+        _run_git(["worktree", "add", worktree_dir, branch], cwd=root)
+
+
+def replace_labels(repo_path: str, issue_number: int, add: list[str], remove: list[str]) -> None:
+    args = ["issue", "edit", str(issue_number)]
+    for label in add or []:
+        args.extend(["--add-label", label])
+    for label in remove or []:
+        args.extend(["--remove-label", label])
+    proc = _run_gh(args, cwd=repo_path)
+    _ensure_success(proc, f"failed to update labels for issue #{issue_number}")
+
+
+def ensure_pr(repo_path: str, issue_number: int, branch: str, title: str) -> Optional[str]:
+    if not branch:
+        return None
+    proc = _run_gh(["pr", "list", "--head", branch, "--json", "url,number"], cwd=repo_path)
+    existing = json.loads(_ensure_success(proc, "failed to list PRs") or "[]")
+    if existing:
+        return existing[0].get("url")
+    _run_git(["push", "-u", "origin", branch], cwd=repo_path)
+    body = f"Automated by orch for Issue #{issue_number}."
+    proc_create = _run_gh(["pr", "create", "--fill", "--head", branch, "--title", title, "--body", body], cwd=repo_path)
+    try:
+        output = _ensure_success(proc_create, "failed to create PR").strip()
+        return output or None
+    except GitHubError:
+        return None
+
 
 
 # Blockers, SLAs, and status comment helpers

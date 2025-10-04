@@ -91,8 +91,28 @@ It will:
 6) on completion optionally open a PR and relabel to `agent:review`.
 
 > Project fields: if you want Projects to mirror labels, add a small workflow that maps
-> label -> field. A starter workflow is provided in `.github/workflows/labels-to-project.yml`
-> (edit the project/field IDs for your org).
+> label → field. Create `.github/workflows/labels-to-project.yml` (or similar) and paste the
+> starter snippet below, editing the project/field IDs for your org.
+
+```yaml
+name: Sync labels → Project status
+on:
+  issues:
+    types: [opened, labeled, unlabeled]
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    permissions:
+      issues: write
+      contents: read
+      projects: write
+    steps:
+      - uses: actions/github-script@v7
+        with:
+          script: |
+            // TODO: set your project/field IDs; this is a stub showing where to map
+            core.info('Map labels to a Project status here (implementation left to repo owner).')
+```
 
 ### Orchestrator & sub-agent prompts
 
